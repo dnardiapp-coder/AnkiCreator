@@ -19,17 +19,17 @@ st.set_page_config(page_title="Anki-Generator", page_icon="🧠", layout="wide")
 # Lê chave da OpenAI de env OU de Secrets (Streamlit Cloud)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
-    st.error("Defina OPENAI_API_KEY nos Secrets ou variável de ambiente.")
+    st.error("Defina OPENAI_API_KEY nos Secrets (Streamlit) ou variável de ambiente.")
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-TEXT_MODEL = "gpt-4o-mini"  # troque para o modelo que você tem disponível
+TEXT_MODEL = "gpt-4o-mini"  # troque para um modelo disponível na sua conta
 
 SYSTEM_PROMPT = """
 Você é uma IA especialista em Design Instrucional e Ciência Cognitiva, integrada ao 'Anki-Generator'.
 Princípios: recordação ativa; conhecimento atômico (uma ideia por cartão); frente curta; verso objetivo com 1–2 exemplos.
-Use Basic/Reverse/Cloze (evite múltipla escolha). Se houver material do usuário, referencie arquivo/página.
-Saída: JSON no formato:
+Use Basic/Reverse/Cloze (evite múltipla escolha). Se houver material do usuário, referencie arquivo/página quando possível.
+Saída: JSON:
 {
  "deck":{"title":"string","language":"string","level":"string","topic":"string","source_summary":"string","card_count_planned":number},
  "cards":[{"id":"string","type":"basic|reverse|cloze","front":"string","back":"string","hint":"string|null",
@@ -40,6 +40,7 @@ Saída: JSON no formato:
            "rationale":"string"}],
  "qa_report":{"duplicates_removed":number,"too_broad_removed":number,"notes":"string"}
 }
+Regra: 'card_count_planned' deve corresponder ao número real de itens em 'cards'.
 """
 
 # =========================
@@ -55,7 +56,7 @@ def examples_to_html(examples: Optional[List[Dict[str, Any]]]) -> str:
     if not examples: return ""
     items = []
     for ex in examples:
-        if not isinstance(ex, dict): 
+        if not isinstance(ex, dict):
             continue
         line = str(ex.get("text",""))
         tr = ex.get("translation"); nt = ex.get("notes")
@@ -172,7 +173,7 @@ def compress_materials(materials: List[Dict[str, Any]], max_chars: int = 12000) 
     return "\n\n".join(parts)[:max_chars]
 
 # =========================
-# OPENAI → GERAÇÃO DO DECK
+# OPENAI → GERAÇÃO DO DECK (básico)
 # =========================
 def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = client.chat.completions.create(
@@ -194,9 +195,9 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cards, list):
         cards = []
 
-    # Normaliza cloze (alguns modelos usam Text/BackExtra)
+    # Normaliza cloze (compat Text/BackExtra)
     for c in cards:
-        if not isinstance(c, dict): 
+        if not isinstance(c, dict):
             continue
         ctype = (c.get("type") or "basic").lower()
         if ctype == "cloze":
@@ -213,6 +214,131 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     data["deck"]["card_count_planned"] = len(cards)
     data["cards"] = cards
     return data
+
+# =========================
+# DEDUPE + TOP-UP (modo estrito)
+# =========================
+def _card_signature(card: dict) -> str:
+    """Assinatura simples para detectar duplicatas (tipo + frente + verso)."""
+    t = (card.get("type") or "").lower().strip()
+    f = (card.get("front") or card.get("Text") or "").strip().lower()
+    b = (card.get("back") or card.get("BackExtra") or "").strip().lower()
+    return f"{t}|{f[:160]}|{b[:160]}"
+
+def dedupe_cards(cards: list) -> list:
+    seen, out = set(), []
+    for c in cards or []:
+        if not isinstance(c, dict):
+            continue
+        sig = _card_signature(c)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(c)
+    return out
+
+def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lote: int = 20) -> list:
+    """
+    Pede ao modelo APENAS os cartões faltantes (em lotes), evitando duplicatas.
+    Retorna lista de cards.
+    """
+    novos_total = []
+    restantes = max(0, int(faltantes))
+
+    # resumo mínimo dos já gerados para reduzir duplicação
+    resumo = []
+    for c in ja_gerados or []:
+        resumo.append({
+            "type": c.get("type"),
+            "front": c.get("front") or c.get("Text"),
+            "back":  c.get("back")  or c.get("BackExtra"),
+            "tags":  c.get("tags", [])
+        })
+
+    while restantes > 0:
+        pedir = min(restantes, lote)
+        sys_addendum = (
+            SYSTEM_PROMPT
+            + "\n\nINSTRUÇÃO ADICIONAL: Gere EXATAMENTE o número solicitado e responda SOMENTE com JSON no formato "
+              '{"cards":[{...}]}'
+              " (sem 'deck' e sem 'qa_report'). Não repita nenhum cartão existente."
+        )
+        pedido = {
+            "pedido": f"Gerar exatamente {pedir} novos cartões NÃO-DUPLICADOS, mantendo active recall e conhecimento atômico.",
+            "payload_base": {
+                "idioma_alvo": payload.get("idioma_alvo"),
+                "nivel_proficiencia": payload.get("nivel_proficiencia"),
+                "topico": payload.get("topico"),
+                "tipos_permitidos": payload.get("tipos_permitidos"),
+                "politica_voz": payload.get("politica_voz"),
+                "materiais_digest": payload.get("materiais_digest","")
+            },
+            "cartoes_ja_gerados_resumo": resumo
+        }
+        resp = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {"role":"system","content": sys_addendum},
+                {"role":"user","content": json.dumps(pedido, ensure_ascii=False)}
+            ],
+            temperature=0,
+            response_format={"type":"json_object"},
+        )
+        try:
+            data = json.loads(resp.choices[0].message.content)
+        except Exception:
+            data = {}
+        novos = data.get("cards", [])
+        if not isinstance(novos, list):
+            novos = []
+
+        # normaliza cloze (compat Text/BackExtra)
+        for c in novos:
+            if not isinstance(c, dict):
+                continue
+            if (c.get("type") or "").lower() == "cloze":
+                if not c.get("front") and c.get("Text"):
+                    c["front"] = c["Text"]
+                if not c.get("back") and c.get("BackExtra"):
+                    c["back"] = c["BackExtra"]
+
+        # junta e deduplica contra o que já temos
+        candidatos = dedupe_cards((ja_gerados or []) + novos)
+        have = {_card_signature(x) for x in (ja_gerados or [])}
+        realmente_novos = [c for c in candidatos if _card_signature(c) not in have]
+
+        ja_gerados = dedupe_cards((ja_gerados or []) + realmente_novos)
+        novos_total += realmente_novos
+        restantes = max(0, faltantes - len(novos_total))
+
+        # se o modelo não cooperar, tenta sair do loop
+        if pedir > 0 and len(realmente_novos) == 0:
+            break
+
+    return novos_total[:faltantes]
+
+def gerar_baralho_estrito(payload: dict, max_rodadas: int = 4, lote: int = 20) -> dict:
+    """
+    Garante exatamente payload['limite_cartoes'].
+    1) Gera o baralho base.
+    2) Se vier < limite, faz rodadas complementando até alcançar.
+    """
+    desired = int(payload.get("limite_cartoes", 20))
+    base = gerar_baralho(payload)
+    cards = dedupe_cards(base.get("cards", []))
+
+    rod = 0
+    while len(cards) < desired and rod < max_rodadas:
+        faltam = desired - len(cards)
+        novos = gerar_cartoes_adicionais(payload, cards, faltam, lote=lote)
+        cards = dedupe_cards(cards + novos)
+        rod += 1
+
+    # ajusta meta e corta ao tamanho pedido
+    base["cards"] = cards[:desired]
+    base.setdefault("deck", {})
+    base["deck"]["card_count_planned"] = len(base["cards"])
+    return base
 
 # =========================
 # ANKI (genanki)
@@ -358,6 +484,7 @@ with col1:
     limite = st.slider("Qtde de cartões", 4, 80, 20, 1)
     tipos  = st.multiselect("Tipos de cartão", ["basic","reverse","cloze"], default=["basic","reverse","cloze"])
     tts    = st.radio("TTS (gTTS)", ["nenhuma","respostas","exemplos","todas"], index=2)
+    strict = st.checkbox("Exigir exatamente N (completar se vierem menos)", value=True)
 with col2:
     topico = st.text_area("Tópico", "Tempos do passado em francês: passé composé, imparfait, plus-que-parfait, passé simple – usos, diferenças e exemplos", height=120)
     files  = st.file_uploader("Arquivos (PDF/DOCX/TXT/MD – opcional)", type=["pdf","docx","txt","md","markdown"], accept_multiple_files=True)
@@ -381,11 +508,11 @@ if btn:
             "politica_voz": f"tts={tts}",
             "materiais_digest": digest
         }
-        data = gerar_baralho(payload)
+        data = gerar_baralho_estrito(payload) if strict else gerar_baralho(payload)
         apkg_bytes = build_apkg_bytes(data, tts_policy=tts)
         file_name = f"Anki-Generator_{int(time.time())}.apkg"
 
-        st.success("Baralho gerado!")
+        st.success(f"Baralho gerado com {len(data.get('cards', []))} cartões!")
         st.download_button("⬇️ Baixar .apkg", data=apkg_bytes, file_name=file_name, mime="application/octet-stream")
         with st.expander("🔍 Ver JSON gerado (debug)"):
             st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
