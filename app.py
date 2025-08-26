@@ -23,7 +23,7 @@ if not OPENAI_API_KEY:
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-TEXT_MODEL = "gpt-4o-mini"  # troque para um modelo disponível na sua conta
+TEXT_MODEL = "gpt-4o"  # troque para um modelo disponível na sua conta
 
 SYSTEM_PROMPT = """
 Você é uma IA especialista em Design Instrucional e Ciência Cognitiva, integrada ao 'Anki-Generator'.
