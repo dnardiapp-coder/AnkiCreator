@@ -22,7 +22,7 @@ if not OPENAI_API_KEY:
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-TEXT_MODEL = "gpt-4o-mini"  # troque para um modelo disponível na sua conta
+TEXT_MODEL = "gpt-4o-mini"  # troque se quiser
 
 SYSTEM_PROMPT = """
 Você é uma IA especialista em Design Instrucional e Ciência Cognitiva, integrada ao 'Anki-Generator'.
@@ -64,9 +64,7 @@ def html_escape(s: Optional[str]) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
 def normalize_text_for_html(s: str, cloze: bool = False) -> str:
-    """
-    Remove cercas ```...```, converte \n em <br>. Se cloze=True, preserva {{c1::...}}.
-    """
+    """Remove cercas, converte \\n em <br>. Se cloze=True, preserva {{c1::...}}."""
     if s is None: return ""
     s = str(s).strip()
     s = re.sub(r"^```[\s\S]*?\n|```$", "", s)  # limpa cercas simples
@@ -76,6 +74,18 @@ def normalize_text_for_html(s: str, cloze: bool = False) -> str:
         s = html_escape(s)
     s = s.replace("\n","<br>")
     return s
+
+def strip_html_to_plain(s: str) -> str:
+    """Texto para TTS: remove tags e entidades simples."""
+    if not s: return ""
+    # remove tags
+    s2 = re.sub(r"<[^>]+>", " ", s)
+    # entidades básicas
+    s2 = (s2.replace("&nbsp;"," ").replace("&amp;","&")
+              .replace("&lt;","<").replace("&gt;",">"))
+    # normaliza espaços
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
 
 def examples_to_html(examples: Optional[List[Dict[str, Any]]]) -> str:
     if not examples: return ""
@@ -159,15 +169,18 @@ def looks_like_question(text: str, lang: str) -> bool:
     return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp, []))
 
 def orient_q_a(card: dict, lang: str) -> tuple[str, str]:
-    """Garante que a frente seja uma PERGUNTA, se detectável; senão mantém."""
+    """Pergunta → Resposta. Se nada parecer pergunta, usa o lado mais curto como pergunta."""
     f = (card.get("front") or card.get("Text") or "").strip()
     b = (card.get("back")  or card.get("BackExtra") or "").strip()
     fq, bq = looks_like_question(f, lang), looks_like_question(b, lang)
-    if fq and not bq:   # ok
+    if fq and not bq:
         return f, b
-    if bq and not fq:   # invertido
+    if bq and not fq:
         return b, f
-    return f, b         # ambíguo → mantém
+    # fallback: o mais curto vira pergunta
+    if len(f) > len(b):
+        return b, f
+    return f, b
 
 def extra_label(kind: str, lang: str) -> str:
     lp = (lang or "en").lower()
@@ -181,7 +194,6 @@ def extra_label(kind: str, lang: str) -> str:
         return {"usage_tip":"Praxistipp:", "common_pitfall":"Häufige Falle:", "mnemonic":"Eselsbrücke:", "self_check":"Selbsttest:", "source":"Quelle:", "none":""}.get(kind,"")
     if lp.startswith("it"):
         return {"usage_tip":"Suggerimento d’uso:", "common_pitfall":"Errore comune:", "mnemonic":"Mnemotecnica:", "self_check":"Auto-verifica:", "source":"Fonte:", "none":""}.get(kind,"")
-    # default EN
     return {"usage_tip":"Usage tip:", "common_pitfall":"Common pitfall:", "mnemonic":"Mnemonic:", "self_check":"Self-check:", "source":"Source:", "none":""}.get(kind,"")
 
 # =========================
@@ -366,9 +378,9 @@ def gerar_baralho_estrito(payload: dict, max_rodadas: int = 4, lote: int = 20) -
     return base
 
 # =========================
-# ANKI (genanki) — MODELOS v2 (IDs novos)
+# ANKI (genanki) — MODELOS v3
 # =========================
-def stable_model_id(name: str, version: int = 2) -> int:
+def stable_model_id(name: str, version: int = 3) -> int:
     h = hashlib.sha1(f"{name}-v{version}".encode("utf-8")).hexdigest()
     return int(h[:10], 16)
 
@@ -376,6 +388,7 @@ COMMON_CSS = """
 .card { font-family: -apple-system, Segoe UI, Roboto, Arial; font-size: 20px; text-align: left; color: #222; background: #fff; }
 .front { font-size: 1.05em; line-height: 1.45; }
 .back  { line-height: 1.5; }
+.hdr  { font-weight: 600; opacity: .8; margin: 6px 0 4px; }
 .hint { margin-top: 8px; font-size: 0.95em; color: #666; }
 .examples { margin-top: 12px; }
 .examples-list { padding-left: 18px; }
@@ -387,43 +400,46 @@ hr { margin: 14px 0; }
 """
 
 MODEL_BASIC = genanki.Model(
-    stable_model_id("Anki-Generator Basic", version=2), "Anki-Generator Basic (v2)",
+    stable_model_id("Anki-Generator Basic", version=3), "Anki-Generator Basic (v3)",
     fields=[{"name":"Front"},{"name":"Back"},{"name":"Hint"},{"name":"Examples"},{"name":"Audio"},{"name":"Extra"}],
     templates=[{
         "name":"Card 1",
-        "qfmt":"<div class='front'>{{Front}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
-        "afmt":"{{FrontSide}}<hr id='answer'><div class='back'>{{Back}}</div>"
+        "qfmt":"<div class='hdr'>Q:</div><div class='front'>{{Front}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+        "afmt":"<div class='hdr'>A:</div><div class='back'>{{Back}}</div>"
                "{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}"
                "{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}"
                "{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+               "<hr><div class='hdr'>Q:</div><div class='front'>{{Front}}</div>"
     }],
     css=COMMON_CSS
 )
 
 MODEL_REVERSE = genanki.Model(
-    stable_model_id("Anki-Generator Reverse", version=2), "Anki-Generator Reverse (v2)",
+    stable_model_id("Anki-Generator Reverse", version=3), "Anki-Generator Reverse (v3)",
     fields=[{"name":"Front"},{"name":"Back"},{"name":"Hint"},{"name":"Examples"},{"name":"Audio"},{"name":"Extra"}],
     templates=[{
         "name":"Reverse Only",
-        "qfmt":"<div class='front'>{{Back}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
-        "afmt":"<div class='front'>{{Back}}</div><hr id='answer'><div class='back'>{{Front}}</div>"
+        "qfmt":"<div class='hdr'>Q:</div><div class='front'>{{Back}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+        "afmt":"<div class='hdr'>A:</div><div class='back'>{{Front}}</div>"
                "{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}"
                "{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}"
                "{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+               "<hr><div class='hdr'>Q:</div><div class='front'>{{Back}}</div>"
     }],
     css=COMMON_CSS
 )
 
 MODEL_CLOZE = genanki.Model(
-    stable_model_id("Anki-Generator Cloze", version=2), "Anki-Generator Cloze (v2)",
+    stable_model_id("Anki-Generator Cloze", version=3), "Anki-Generator Cloze (v3)",
     fields=[{"name":"Text"},{"name":"BackExtra"},{"name":"Hint"},{"name":"Examples"},{"name":"Audio"},{"name":"Extra"}],
     templates=[{
         "name":"Cloze Card",
-        "qfmt":"<div class='front'>{{cloze:Text}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
-        "afmt":"<div class='front'>{{cloze:Text}}</div><hr id='answer'><div class='back'>{{BackExtra}}</div>"
+        "qfmt":"<div class='hdr'>Q:</div><div class='front'>{{cloze:Text}}</div>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+        "afmt":"<div class='hdr'>A:</div><div class='back'>{{BackExtra}}</div>"
                "{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}"
                "{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}"
                "{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+               "<hr><div class='hdr'>Q:</div><div class='front'>{{cloze:Text}}</div>"
     }],
     css=COMMON_CSS,
     model_type=genanki.Model.CLOZE
@@ -432,6 +448,42 @@ MODEL_CLOZE = genanki.Model(
 def build_deck_id(title: str) -> int:
     h = hashlib.sha1(title.encode("utf-8")).hexdigest()
     return int(h[:10], 16)
+
+# ---------- TTS selection ----------
+def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str, back_raw: str) -> Optional[str]:
+    """
+    Decide o texto a ser falado:
+    - 'todas': audio_script > primeiro exemplo > resposta > frente
+    - 'respostas': audio_script > resposta > primeiro exemplo > frente
+    - 'exemplos': primeiro exemplo > audio_script > resposta > frente
+    - 'nenhuma': None
+    Retorna texto já sem HTML/entidades.
+    """
+    if policy == "nenhuma":
+        return None
+
+    audio_script = (card.get("audio_script") or "").strip()
+    ex = ""
+    if isinstance(card.get("examples"), list) and card["examples"]:
+        ex = (card["examples"][0].get("text") or "").strip()
+
+    # ordem por política
+    candidates = []
+    p = policy.lower()
+    if p == "todas":
+        candidates = [audio_script, ex, back_raw, front_raw]
+    elif p == "respostas":
+        candidates = [audio_script, back_raw, ex, front_raw]
+    elif p == "exemplos":
+        candidates = [ex, audio_script, back_raw, front_raw]
+    else:
+        candidates = [audio_script, back_raw, ex, front_raw]
+
+    for c in candidates:
+        t = strip_html_to_plain(c)
+        if t:
+            return t
+    return None
 
 def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", extra_kind: str = "usage_tip") -> bytes:
     meta = deck_json.get("deck", {})
@@ -445,8 +497,7 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
 
     def add_note(c: Dict[str, Any]):
         ctype = (c.get("type") or "basic").lower()
-        # Trate reverse como basic para manter pergunta→resposta
-        if ctype == "reverse":
+        if ctype == "reverse":  # render como basic (pergunta→resposta)
             ctype = "basic"
 
         hint = html_escape(c.get("hint") or "")
@@ -471,16 +522,20 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
 
         extra = "".join(extra_bits)
 
+        # ======= ÁUDIO =======
         audio_field = ""
-        wants_tts = tts_policy != "nenhuma"
-        if wants_tts and c.get("audio_script"):
-            bts = synth_audio(c["audio_script"], lang)
+        # Escolha do texto TTS usa os RAWs antes da normalização visual
+        front_raw, back_raw = orient_q_a(c, lang)
+        tts_text = choose_tts_text(c, tts_policy, lang, front_raw, back_raw)
+        if tts_text:
+            bts = synth_audio(tts_text, lang)
             if bts:
                 mp3_path = os.path.join(tmpdir, f"tts_{int(time.time()*1000)}.mp3")
                 with open(mp3_path, "wb") as f: f.write(bts)
                 media_files.append(mp3_path)
                 audio_field = f"[sound:{os.path.basename(mp3_path)}]"
 
+        # ======= CAMPOS VISUAIS =======
         if ctype == "cloze":
             text = c.get("front","")  # já normalizado
             back_extra = c.get("back","") or ""
@@ -490,8 +545,6 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
                 tags=sanitize_tags(c.get("tags", []))
             )
         else:
-            # Orienta para que a frente seja a PERGUNTA
-            front_raw, back_raw = orient_q_a(c, lang)
             front = normalize_text_for_html(front_raw)
             back  = normalize_text_for_html(back_raw)
             note = genanki.Note(
