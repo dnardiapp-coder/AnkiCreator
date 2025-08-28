@@ -340,6 +340,30 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cards, list):
         cards = []
 
+    # --- Normalize cards BEFORE validation ---
+normalized = []
+for c in cards:
+    if not isinstance(c, dict):
+        continue
+    typ = (c.get("type") or "basic").lower()
+
+    # Map Anki-style cloze fields to our front/back
+    if typ == "cloze":
+        if not c.get("front") and c.get("Text"):
+            c["front"] = str(c.get("Text", ""))
+        if not c.get("back"):
+            # Prefer provided BackExtra; otherwise add a small placeholder
+            be = str(c.get("BackExtra", "")).strip()
+            c["back"] = be if be else "(cloze answer on reveal)"
+
+    # Ensure required keys exist as strings
+    c["front"] = str(c.get("front", "")).strip()
+    c["back"]  = str(c.get("back",  "")).strip()
+
+    normalized.append(c)
+cards = normalized
+# --- End normalization ---
+
     # Validate and normalize
     cards = [c for c in cards if valid_card(c)]
     for c in cards:
