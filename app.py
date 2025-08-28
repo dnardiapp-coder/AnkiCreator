@@ -83,7 +83,7 @@ AUDIO_CHAR_LIMIT = 400
 # -------------------------
 # The prompt is now positively constrained: it is asked to generate from a topic
 # if no materials are available, rather than being told "not to generate"
-# when input is null, a common failure mode for LLMs.[6, 7]
+# when input is null, a common failure mode for LLMs.
 SYSTEM_PROMPT = """
 Você é uma IA especialista em Design Instrucional e Ciência Cognitiva que atua como **Criador de Baralhos Anki**.
 Trabalhe em 3 passos: (1) entender pedido e propor um plano, (2) gerar prévia variada e específica, (3) produzir o baralho final.
@@ -127,7 +127,7 @@ Percentuais ~somam 100 (ignore scenario/procedure se não aplicável).
 
 # -------------------------
 # Data Ingestion & Processing
-# (Can be moved to src/data_processing/ in a modular refactor) [8, 9]
+# (Can be moved to src/data_processing/ in a modular refactor)
 # -------------------------
 
 def extract_pdf(file_bytes: bytes) -> str:
@@ -198,12 +198,12 @@ def ingest_youtube_transcript(url: str) -> List]:
     try:
         yt = YouTube(url)
         video_id = yt.video_id
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts([video_id])
         transcript = transcript_list.find_transcript(['en', 'pt', 'fr']) # Prioritize languages
         raw_text = transcript.fetch()
         full_transcript = " ".join([t['text'] for t in raw_text])
         title = yt.title
-        return
+        return [{"file": f"youtube_{video_id}", "content": f"# {title}\n{full_transcript}"}]
     except Exception as e:
         st.error(f"Error ingesting YouTube video: {e}")
         return
@@ -263,14 +263,14 @@ def rag_digest(materials: List], topic: str, user_feedback: str, top_k: int = 6,
 
 # -------------------------
 # LLM & API Interface
-# (Can be moved to src/llm/llm_service.py in a modular refactor) [4]
+# (Can be moved to src/llm/llm_service.py in a modular refactor)
 # -------------------------
 
 def chat_json(messages, model=TEXT_MODEL, temperature=0, max_tries=4):
     last_err = None
     for i in range(max_tries):
         try:
-            with st.spinner("Calling AI Model..."): # Visual feedback for API calls.[10, 2, 11]
+            with st.spinner("Calling AI Model..."): # Visual feedback for API calls.
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -294,7 +294,7 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
        ,
         model=TEXT_MODEL, temperature=0
     )
-    # Validate LLM output to prevent empty decks from invalid JSON.[12, 13]
+    # Validate LLM output to prevent empty decks from invalid JSON.
     data = _safe_json(resp.choices.message.content or "{}")
     cards = data.get("cards",)
     if not isinstance(cards, list): cards =
@@ -343,7 +343,7 @@ def generate_assessment(topic: str, goal: str, idioma: str, nivel: str, tipos: l
 
 # -------------------------
 # Validation & variety logic
-# (Can be moved to src/data_processing/data_validator.py in a modular refactor) [12, 13]
+# (Can be moved to src/data_processing/data_validator.py in a modular refactor)
 # -------------------------
 
 REQUIRED_CARD_FIELDS = {"type","front","back"}
@@ -411,7 +411,7 @@ def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float, requi
 
 # -------------------------
 # Anki Deck Generation & Utilities
-# (Can be moved to src/anki_generator/deck_creator.py in a modular refactor) [10, 14]
+# (Can be moved to src/anki_generator/deck_creator.py in a modular refactor)
 # -------------------------
 
 # Helper functions...
@@ -437,7 +437,7 @@ def strip_html_to_plain(s: str) -> str:
     if not s: return ""
     s2 = re.sub(r"<[^>]+>", " ", s)
     s2 = (s2.replace("&nbsp;"," ").replace("&amp;","&")
-             .replace("&lt;","<").replace("&gt;",">"))
+            .replace("&lt;","<").replace("&gt;",">"))
     s2 = re.sub(r"\s+", " ", s2).strip()
     return s2
 def examples_to_html(examples: Optional]]) -> str:
@@ -628,7 +628,7 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples", tt
         back = normalize_text_for_html(back_raw)
         tags = sanitize_tags(c.get("tags",))
         if default_tag: tags = sanitize_tags(tags + [default_tag])
-        # Generate stable GUID for note updates.[10]
+        # Generate stable GUID for note updates.
         guid = genanki.guid_for(front, back, ctype)
         if ctype == "cloze":
             note = genanki.Note(model=MODEL_CLOZE,
@@ -643,7 +643,7 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples", tt
                                 fields=[front, back, hint, examples_html, audio_field, extra],
                                 tags=tags, guid=guid)
         deck.add_note(note)
-    # Use a progress bar for deck building.[13, 15]
+    # Use a progress bar for deck building.
     progress_bar = st.progress(0, "Building Anki deck...")
     for i, c in enumerate(cards):
         if isinstance(c, dict): add_note(c, i)
@@ -762,7 +762,7 @@ with st.expander("📎 (Optional) Add materials for better anchoring"):
                     mats += ingest_youtube_transcript(u)
             if mats:
                 st.session_state.materials.extend(mats)
-                st.toast(f"Added {len(mats)} new sources!", icon="✅") [4]
+                st.toast(f"Added {len(mats)} new sources!", icon="✅")
             else:
                 st.toast("No new sources added.", icon="ℹ️")
     if colm2.button("Clear sources"):
