@@ -1031,7 +1031,7 @@ with top_cols[0]:
 with top_cols[1]:
     if st.button("🔄 Reset session"):
         reset_all()
-        st.experimental_rerun()
+        st.rerun()
 with top_cols[2]:
     st.write("")
     st.caption("Tip: In chat you can say “**language en-US**”, “**set size 80**”, “**preview**”, or “**build**”.")
@@ -1333,4 +1333,4 @@ if user_text:
         reply_chunks.append("Got it. You can say **plan**, **preview**, or **build** — or adjust topic/goal above.")
 
     st.session_state["messages"].append({"role":"assistant","content":"\n\n".join(reply_chunks)})
-    st.experimental_rerun()
+    st.rerun()
