@@ -435,14 +435,11 @@ def valid_card(c: dict) -> bool:
     if not all(k in c and (c[k] is not None and len(str(c[k]).strip()) > 0) for k in REQUIRED_CARD_FIELDS):
         return False
     typ = (c.get("type") or "").lower()
-    if typ == "cloze":
-        # must include exactly one cloze start marker
-        if "{{c" not in c.get("front", ""):
-            return False
-    if len(strip_html_to_plain(c.get("back", ""))) > 420:
+if typ == "cloze":
+    # Accept either our normalized 'front' or raw Anki 'Text'
+    cloze_src = c.get("front", "") or c.get("Text", "")
+    if "{{c" not in cloze_src:
         return False
-    return True
-
 
 def dedupe_cards(cards: list) -> list:
     def sig(c):
