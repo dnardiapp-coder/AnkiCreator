@@ -74,8 +74,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 # -------------------------
 # Constants
 # -------------------------
-TEXT_MODEL = "gpt-4o-mini"
-MAX_AUDIO_FILES = 24
+TEXT_MODEL = "gpt-4o"
+MAX_AUDIO_FILES = 80
 AUDIO_CHAR_LIMIT = 400
 
 # -------------------------
@@ -437,7 +437,7 @@ def strip_html_to_plain(s: str) -> str:
     if not s: return ""
     s2 = re.sub(r"<[^>]+>", " ", s)
     s2 = (s2.replace("&nbsp;"," ").replace("&amp;","&")
-            .replace("&lt;","<").replace("&gt;",">"))
+           .replace("&lt;","<").replace("&gt;",">"))
     s2 = re.sub(r"\s+", " ", s2).strip()
     return s2
 def examples_to_html(examples: Optional]]) -> str:
@@ -852,7 +852,7 @@ def make_payload(n_cards: int, seed_cards=None):
 def build_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = gerar_baralho(payload)
     cards = dedupe_cards(data.get("cards",))
-    seed_ids = {c.get("id") for c in payload.get("seed_cards") or if c.get("id")}
+    seed_ids = {c.get("id") for c in payload.get("seed_cards",) if c.get("id")}
     cards = enforce_variety(cards, st.session_state.domain_kws, payload["max_qa_pct"], payload["require_anchor"], seed_ids)
     data["cards"] = cards[: payload["limite_cartoes"]]
     data["deck"]["card_count_planned"] = len(data["cards"])
