@@ -77,8 +77,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 # -------------------------
 # Constants
 # -------------------------
-TEXT_MODEL = "gpt-4o-mini"
-MAX_AUDIO_FILES = 24
+TEXT_MODEL = "gpt-4o"
+MAX_AUDIO_FILES = 80
 AUDIO_CHAR_LIMIT = 400
 
 
