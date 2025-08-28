@@ -459,8 +459,7 @@ def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float, requi
 # -------------------------
 def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = chat_json(
-        [{"role":"system","content":SYSTEM_P
-ROMPT},
+        [{"role":"system","content":SYSTEM_PROMPT},
          {"role":"user","content":json.dumps(payload, ensure_ascii=False)}],
         model=TEXT_MODEL, temperature=0
     )
