@@ -1,3 +1,4 @@
+```python
 # app.py — A more robust Chat-First Anki Deck Creator
 # This version implements fixes and features based on a comprehensive technical review.
 
@@ -74,8 +75,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 # -------------------------
 # Constants
 # -------------------------
-TEXT_MODEL = "gpt-4o"
-MAX_AUDIO_FILES = 80
+TEXT_MODEL = "gpt-4o-mini"
+MAX_AUDIO_FILES = 24
 AUDIO_CHAR_LIMIT = 400
 
 # -------------------------
@@ -134,7 +135,7 @@ def extract_pdf(file_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes); tmp.flush()
         reader = PdfReader(tmp.name)
-        out =
+        out = []  # Initialize out as a list
         for i, p in enumerate(reader.pages, start=1):
             t = p.extract_text() or ""
             if t.strip(): out.append(f"[p.{i}]\n{t}")
@@ -149,9 +150,9 @@ def extract_docx(file_bytes: bytes) -> str:
 def extract_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
 
-def ingest_files(uploaded_files) -> List]:
-    mats =
-    for f in uploaded_files or:
+def ingest_files(uploaded_files) -> List[Dict[str, Any]]:
+    mats = []
+    for f in uploaded_files or []:
         name = f.name; data = f.read(); low = name.lower()
         if low.endswith(".pdf"): text = extract_pdf(data)
         elif low.endswith(".docx"): text = extract_docx(data)
@@ -182,8 +183,8 @@ def fetch_url_text(url: str, timeout: int = 25) -> str:
     except Exception:
         return ""
 
-def ingest_urls(urls: List[str]) -> List]:
-    mats =
+def ingest_urls(urls: List[str]) -> List[Dict[str, Any]]:
+    mats = []
     for u in urls:
         u = u.strip()
         if not u: continue
@@ -193,8 +194,8 @@ def ingest_urls(urls: List[str]) -> List]:
             mats.append({"file": name, "content": txt})
     return mats
 
-def ingest_youtube_transcript(url: str) -> List]:
-    if not YOUTUBE_DEPS_OK: return
+def ingest_youtube_transcript(url: str) -> List[Dict[str, Any]]:
+    if not YOUTUBE_DEPS_OK: return []
     try:
         yt = YouTube(url)
         video_id = yt.video_id
@@ -206,10 +207,10 @@ def ingest_youtube_transcript(url: str) -> List]:
         return [{"file": f"youtube_{video_id}", "content": f"# {title}\n{full_transcript}"}]
     except Exception as e:
         st.error(f"Error ingesting YouTube video: {e}")
-        return
+        return []
 
-def split_sections(text: str, file_name: str) -> List]:
-    sections =
+def split_sections(text: str, file_name: str) -> List[Dict[str, Any]]:
+    sections = []
     parts = re.split(r"\n(?=#+\s)|\n(?=\[p\.\d+\])", text)
     for i, part in enumerate(parts):
         pt = part.strip()
@@ -218,15 +219,15 @@ def split_sections(text: str, file_name: str) -> List]:
         m = re.match(r"^(#+\s.*)", pt)
         if m: title = m.group(1)
         elif pt.lower().startswith("[p."):
-            title = pt.split("\n",1)
+            title = pt.split("\n",1)[0]
         else:
             title = f"{file_name} — sec {i+1}"
         sections.append({"file": file_name, "title": title, "content": pt[:4000]})
     return sections or [{"file": file_name, "title": f"{file_name} — full", "content": text[:4000]}]
 
-def simple_keyword_rank(query: str, sections: List], top_k: int = 6) -> List[int]:
+def simple_keyword_rank(query: str, sections: List[Dict[str, Any]], top_k: int = 6) -> List[int]:
     q_toks = set(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,}", query.lower()))
-    scores =
+    scores = []
     for i, s in enumerate(sections):
         txt = s["content"].lower()
         score = sum(1 for t in q_toks if t in txt)
@@ -234,7 +235,7 @@ def simple_keyword_rank(query: str, sections: List], top_k: int = 6) -> List[int
     scores.sort(reverse=True)
     return [i for _, i in scores[:top_k]]
 
-def tfidf_rank(query: str, sections: List], top_k: int = 6) -> List[int]:
+def tfidf_rank(query: str, sections: List[Dict[str, Any]], top_k: int = 6) -> List[int]:
     docs = [s["content"] for s in sections]
     try:
         vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.9)
@@ -246,15 +247,16 @@ def tfidf_rank(query: str, sections: List], top_k: int = 6) -> List[int]:
     except Exception:
         return simple_keyword_rank(query, sections, top_k)
 
-def rag_digest(materials: List], topic: str, user_feedback: str, top_k: int = 6, max_chars: int = 12000) -> Tuple]]:
-    if not materials: return "",
-    sections =
+def rag_digest(materials: List[Dict[str, Any]], topic: str, user_feedback: str, top_k: int = 6, max_chars: int = 12000) -> Tuple[str, List[Dict[str, Any]]]:
+    if not materials: return "", []
+    sections = []
     for m in materials:
         sections.extend(split_sections(m["content"], m["file"]))
+    if not sections: return "", []
     query = f"{topic}\n{user_feedback}".strip()
     idxs = tfidf_rank(query, sections, top_k) if SKLEARN_OK else simple_keyword_rank(query, sections, top_k)
     chosen = [sections[i] for i in idxs]
-    parts =
+    parts = []
     for s in chosen:
         hdr = f"# {s['file']} — {s['title']}"
         parts.append(hdr + "\n" + s["content"])
@@ -291,13 +293,12 @@ def _safe_json(content: str) -> dict:
 
 def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = chat_json(
-       ,
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": json.dumps(payload)}],
         model=TEXT_MODEL, temperature=0
     )
-    # Validate LLM output to prevent empty decks from invalid JSON.
-    data = _safe_json(resp.choices.message.content or "{}")
-    cards = data.get("cards",)
-    if not isinstance(cards, list): cards =
+    data = _safe_json(resp.choices[0].message.content or "{}")
+    cards = data.get("cards", [])
+    if not isinstance(cards, list): cards = []
     
     # New validation logic for card content
     cards = [c for c in cards if valid_card(c)]
@@ -305,8 +306,8 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     for c in cards:
         typ = (c.get("type") or "basic").lower()
         if typ == "cloze":
-            if not c.get("front") and c.get("Text"): c["front"] = c
-            if not c.get("back") and c.get("BackExtra"): c["back"] = c
+            if not c.get("front") and c.get("Text"): c["front"] = c["Text"]
+            if not c.get("back") and c.get("BackExtra"): c["back"] = c["BackExtra"]
             c["front"] = normalize_text_for_html(c.get("front",""), cloze=True)
             c["back"] = normalize_text_for_html(c.get("back",""))
         else:
@@ -329,16 +330,16 @@ def generate_assessment(topic: str, goal: str, idioma: str, nivel: str, tipos: l
         "domain_keywords": domain_kws[:30], "max_qa_pct": max_qa_frac, "require_anchor": require_anchor
     }
     resp = chat_json(
-       ,
+        messages=[{"role": "system", "content": ASSESSMENT_SYSTEM}, {"role": "user", "content": json.dumps(payload)}],
         model=TEXT_MODEL, temperature=0
     )
-    data = _safe_json(resp.choices.message.content or "{}")
+    data = _safe_json(resp.choices[0].message.content or "{}")
     data.setdefault("summary","")
-    data.setdefault("key_issues",)
+    data.setdefault("key_issues", [])
     data.setdefault("card_type_strategy",{"basic":35,"reverse":10,"cloze":35,"scenario":10,"procedure":10})
     data.setdefault("anchoring_plan","Reference file + page/section when available. If no materials, rely on topic-only generation.")
     data.setdefault("terminology_focus",domain_kws[:12])
-    data.setdefault("open_questions",)
+    data.setdefault("open_questions", [])
     return data
 
 # -------------------------
@@ -368,8 +369,8 @@ def dedupe_cards(cards: list) -> list:
         f = (c.get("front") or c.get("Text") or "").strip().lower()
         b = (c.get("back") or c.get("BackExtra") or "").strip().lower()
         return hashlib.md5(f"{t}|{f[:160]}|{b[:160]}".encode()).hexdigest()
-    seen, out = set(),
-    for c in cards or:
+    seen, out = set(), []
+    for c in cards or []:
         if not isinstance(c, dict): continue
         s = sig(c)
         if s in seen: continue
@@ -378,9 +379,7 @@ def dedupe_cards(cards: list) -> list:
 
 def contains_domain_keyword(card: dict, kws: List[str]) -> bool:
     if not kws: return True
-    blob = f"{card.get('front','')} |
-
-| {card.get('back','')}".lower()
+    blob = f"{card.get('front','')} | {card.get('back','')}".lower()
     return any(k in blob for k in kws[:40])
 
 def kind_of(c: dict) -> str:
@@ -393,14 +392,14 @@ def kind_of(c: dict) -> str:
     return "basic"
 
 def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float, require_anchor_effective: bool, seed_ids: set) -> List[dict]:
-    filtered =
+    filtered = []
     for c in cards:
         if require_anchor_effective and not anchored_to_source(c) and c.get("id") not in seed_ids:
             continue
         if not contains_domain_keyword(c, kws) and c.get("id") not in seed_ids:
             continue
         filtered.append(c)
-    if not filtered: return
+    if not filtered: return []
     total = max(1, len(filtered))
     qa_idx = [i for i,c in enumerate(filtered) if kind_of(c) == "qa" and c.get("id") not in seed_ids]
     max_qa = int(max_qa_frac * total)
@@ -440,9 +439,9 @@ def strip_html_to_plain(s: str) -> str:
            .replace("&lt;","<").replace("&gt;",">"))
     s2 = re.sub(r"\s+", " ", s2).strip()
     return s2
-def examples_to_html(examples: Optional]]) -> str:
+def examples_to_html(examples: Optional[List[Dict[str, Any]]]) -> str:
     if not examples: return ""
-    items =
+    items = []
     for ex in examples:
         if not isinstance(ex, dict): continue
         line = html_escape(ex.get("text",""))
@@ -464,12 +463,12 @@ def map_lang_for_gtts(language_code: str) -> str:
         if lc.startswith(k):
             for code in choices:
                 if code in langs: return code
-    for cand in (lc, lc.replace("_","-"), lc.split("-")):
+    for cand in (lc, lc.replace("_","-"), lc.split("-")[0]):
         if cand in langs: return cand
     return "en"
 def synth_audio(text: str, lang_code: str) -> Optional[bytes]:
     t = (text or "").strip()
-    if not t: return None
+    if not t or len(t) > AUDIO_CHAR_LIMIT: return None
     try:
         fp = io.BytesIO()
         gTTS(text=t, lang=map_lang_for_gtts(lang_code)).write_to_fp(fp)
@@ -482,8 +481,8 @@ def _clean_tag(tag) -> str:
     t = re.sub(r"[^a-z0-9_\-:]", "", t)
     return t[:40]
 def sanitize_tags(tags) -> list:
-    if not isinstance(tags, list): return
-    out, seen =, set()
+    if not isinstance(tags, list): return []
+    out, seen = [], set()
     for t in tags:
         ct = _clean_tag(t)
         if ct and ct not in seen:
@@ -506,7 +505,7 @@ def looks_like_question(text: str, lang: str) -> bool:
     if "?" in t: return True
     lp = _lang_prefix(lang)
     w = re.sub(r'^[\-\•\–\s]+', '', t.lower())
-    return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp,))
+    return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp,[]))
 def orient_q_a(card: dict, lang: str) -> Tuple[str, str]:
     f = (card.get("front") or card.get("Text") or "").strip()
     b = (card.get("back") or card.get("BackExtra") or "").strip()
@@ -537,20 +536,52 @@ hr { margin: 14px 0; }
 """
 MODEL_BASIC = genanki.Model(
     stable_model_id("Anki-Chat Basic", version=3), "Anki-Chat Basic (v3)",
-    fields=,
-    templates=,
+    fields=[
+        {"name": "Front"}, {"name": "Back"}, {"name": "Hint"},
+        {"name": "Examples"}, {"name": "Audio"}, {"name": "Extra"}
+    ],
+    templates=[
+        {
+            "name": "Card 1",
+            "qfmt": "{{Front}}<br>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+            "afmt": "{{Back}}{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+        }
+    ],
     css=COMMON_CSS
 )
 MODEL_REVERSE = genanki.Model(
     stable_model_id("Anki-Chat Reverse", version=3), "Anki-Chat Reverse (v3)",
-    fields=,
-    templates=,
+    fields=[
+        {"name": "Front"}, {"name": "Back"}, {"name": "Hint"},
+        {"name": "Examples"}, {"name": "Audio"}, {"name": "Extra"}
+    ],
+    templates=[
+        {
+            "name": "Card 1",
+            "qfmt": "{{Front}}<br>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+            "afmt": "{{Back}}{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+        },
+        {
+            "name": "Card 2",
+            "qfmt": "{{Back}}<br>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+            "afmt": "{{Front}}{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+        }
+    ],
     css=COMMON_CSS
 )
 MODEL_CLOZE = genanki.Model(
     stable_model_id("Anki-Chat Cloze", version=3), "Anki-Chat Cloze (v3)",
-    fields=,
-    templates=,
+    fields=[
+        {"name": "Text"}, {"name": "BackExtra"}, {"name": "Hint"},
+        {"name": "Examples"}, {"name": "Audio"}, {"name": "Extra"}
+    ],
+    templates=[
+        {
+            "name": "Cloze",
+            "qfmt": "{{cloze:Text}}<br>{{#Hint}}<div class='hint'>{{Hint}}</div>{{/Hint}}",
+            "afmt": "{{cloze:Text}}<br>{{BackExtra}}{{#Examples}}<div class='examples'>{{Examples}}</div>{{/Examples}}{{#Audio}}<div class='audio'>{{Audio}}</div>{{/Audio}}{{#Extra}}<div class='extra'>{{Extra}}</div>{{/Extra}}"
+        }
+    ],
     css=COMMON_CSS,
     model_type=genanki.Model.CLOZE
 )
@@ -562,9 +593,9 @@ def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str
     audio_script = (card.get("audio_script") or "").strip()
     ex = ""
     if isinstance(card.get("examples"), list) and card["examples"]:
-        ex = (card["examples"].get("text") or "").strip()
+        ex = (card["examples"][0].get("text") or "").strip()
     p = policy.lower()
-    candidates =
+    candidates = []
     if p == "all":      candidates = [audio_script, ex, back_raw, front_raw]
     elif p == "answers": candidates = [audio_script, back_raw, ex, front_raw]
     elif p == "examples":candidates = [ex, audio_script, back_raw, front_raw]
@@ -574,88 +605,91 @@ def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str
         if t: return t
     return None
 
+import shutil
+
 def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples", tts_coverage: str = "sampled", default_tag: str = "") -> bytes:
     meta = deck_json.get("deck", {})
-    cards = deck_json.get("cards",)
-    title = meta.get("title","Anki Deck")
-    lang = meta.get("language","en")
+    cards = deck_json.get("cards", [])
+    title = meta.get("title", "Anki Deck")
+    lang = meta.get("language", "en")
     def anchored(c): return 1 if anchored_to_source(c) else 0
-    def diff_rank(c): return {"easy":0,"medium":1,"hard":2}.get((c.get("difficulty") or "").lower(), 1)
+    def diff_rank(c): return {"easy":0, "medium":1, "hard":2}.get((c.get("difficulty") or "").lower(), 1)
     cards = sorted(cards, key=lambda c: (-anchored(c), c.get("type",""), diff_rank(c), c.get("id","")))
     deck = genanki.Deck(build_deck_id(title), title)
-    media_files: List[str] =
+    media_files: List[str] = []
     tmpdir = tempfile.mkdtemp(prefix="anki_media_")
-    idxs_for_audio = set()
-    if tts_policy!= "none" and len(cards) > 0:
-        if tts_coverage.lower().startswith("all"):
-            idxs_for_audio = set(range(len(cards)))
-        else:
-            idxs_for_audio = set(random.sample(range(len(cards)), min(MAX_AUDIO_FILES, len(cards))))
-    audio_map = {}
-    if idxs_for_audio:
-        def synth_one(idx):
-            c = cards[idx]; fr, br = orient_q_a(c, lang)
-            txt = choose_tts_text(c, tts_policy, lang, fr, br)
-            if not txt: return idx, "", ""
-            b = synth_audio(txt, lang)
-            if not b: return idx, "", ""
-            p = os.path.join(tmpdir, f"tts_{int(time.time()*1000)}_{idx}.mp3")
-            with open(p, "wb") as f: f.write(b)
-            return idx, f"[sound:{os.path.basename(p)}]", p
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futs = [ex.submit(synth_one, i) for i in idxs_for_audio]
-            with st.spinner("Generating audio..."):
-                for fut in as_completed(futs):
-                    try:
-                        i, field, path = fut.result()
-                        if field:
-                            audio_map[i] = field
-                            media_files.append(path)
-                    except Exception:
-                        pass
-    def add_note(c: Dict[str, Any], index: int):
-        ctype = (c.get("type") or "basic").lower()
-        hint = html_escape(c.get("hint") or "")
-        examples_html = examples_to_html(c.get("examples"))
-        src = c.get("source_ref") or {}
-        extra_bits =
-        if (src.get("file") or src.get("page_or_time")):
-            extra_bits.append(f"<div><b>Source:</b> {html_escape(src.get('file') or '')} {html_escape(src.get('page_or_time') or '')}</div>")
-        extra = "".join(extra_bits)
-        audio_field = audio_map.get(index, "")
-        front_raw, back_raw = orient_q_a(c, lang)
-        front = normalize_text_for_html(front_raw, cloze=(ctype=="cloze"))
-        back = normalize_text_for_html(back_raw)
-        tags = sanitize_tags(c.get("tags",))
-        if default_tag: tags = sanitize_tags(tags + [default_tag])
-        # Generate stable GUID for note updates.
-        guid = genanki.guid_for(front, back, ctype)
-        if ctype == "cloze":
-            note = genanki.Note(model=MODEL_CLOZE,
-                                fields=[front, back, hint, examples_html, audio_field, extra],
-                                tags=tags, guid=guid)
-        elif ctype == "reverse":
-            note = genanki.Note(model=MODEL_REVERSE,
-                                fields=[front, back, hint, examples_html, audio_field, extra],
-                                tags=tags, guid=guid)
-        else:
-            note = genanki.Note(model=MODEL_BASIC,
-                                fields=[front, back, hint, examples_html, audio_field, extra],
-                                tags=tags, guid=guid)
-        deck.add_note(note)
-    # Use a progress bar for deck building.
-    progress_bar = st.progress(0, "Building Anki deck...")
-    for i, c in enumerate(cards):
-        if isinstance(c, dict): add_note(c, i)
-        progress_bar.progress((i + 1) / len(cards), text=f"Adding card {i+1} of {len(cards)}...")
-    progress_bar.empty()
-    pkg = genanki.Package(deck)
-    if media_files: pkg.media_files = media_files
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".apkg") as tmp:
-        pkg.write_to_file(tmp.name)
-        with open(tmp.name, "rb") as f:
-            apkg_bytes = f.read()
-    return apkg_bytes
+    try:
+        idxs_for_audio = set()
+        if tts_policy != "none" and len(cards) > 0:
+            if tts_coverage.lower().startswith("all"):
+                idxs_for_audio = set(range(len(cards)))
+            else:
+                idxs_for_audio = set(random.sample(range(len(cards)), min(MAX_AUDIO_FILES, len(cards))))
+        audio_map = {}
+        if idxs_for_audio:
+            def synth_one(idx):
+                c = cards[idx]; fr, br = orient_q_a(c, lang)
+                txt = choose_tts_text(c, tts_policy, lang, fr, br)
+                if not txt: return idx, "", ""
+                b = synth_audio(txt, lang)
+                if not b: return idx, "", ""
+                p = os.path.join(tmpdir, f"tts_{int(time.time()*1000)}_{idx}.mp3")
+                with open(p, "wb") as f: f.write(b)
+                return idx, f"[sound:{os.path.basename(p)}]", p
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futs = [ex.submit(synth_one, i) for i in idxs_for_audio]
+                with st.spinner("Generating audio..."):
+                    for fut in as_completed(futs):
+                        try:
+                            i, field, path = fut.result()
+                            if field:
+                                audio_map[i] = field
+                                media_files.append(path)
+                        except Exception:
+                            pass
+        def add_note(c: Dict[str, Any], index: int):
+            ctype = (c.get("type") or "basic").lower()
+            hint = html_escape(c.get("hint") or "")
+            examples_html = examples_to_html(c.get("examples"))
+            src = c.get("source_ref") or {}
+            extra_bits = []
+            if (src.get("file") or src.get("page_or_time")):
+                extra_bits.append(f"<div><b>Source:</b> {html_escape(src.get('file') or '')} {html_escape(src.get('page_or_time') or '')}</div>")
+            extra = "".join(extra_bits)
+            audio_field = audio_map.get(index, "")
+            front_raw, back_raw = orient_q_a(c, lang)
+            front = normalize_text_for_html(front_raw, cloze=(ctype=="cloze"))
+            back = normalize_text_for_html(back_raw)
+            tags = sanitize_tags(c.get("tags", []))
+            if default_tag: tags = sanitize_tags(tags + [default_tag])
+            guid = genanki.guid_for(front, back, ctype)
+            if ctype == "cloze":
+                note = genanki.Note(model=MODEL_CLOZE,
+                                    fields=[front, back, hint, examples_html, audio_field, extra],
+                                    tags=tags, guid=guid)
+            elif ctype == "reverse":
+                note = genanki.Note(model=MODEL_REVERSE,
+                                    fields=[front, back, hint, examples_html, audio_field, extra],
+                                    tags=tags, guid=guid)
+            else:
+                note = genanki.Note(model=MODEL_BASIC,
+                                    fields=[front, back, hint, examples_html, audio_field, extra],
+                                    tags=tags, guid=guid)
+            deck.add_note(note)
+        progress_bar = st.progress(0, "Building Anki deck...")
+        for i, c in enumerate(cards):
+            if isinstance(c, dict): add_note(c, i)
+            progress_bar.progress((i + 1) / len(cards), text=f"Adding card {i+1} of {len(cards)}...")
+        progress_bar.empty()
+        pkg = genanki.Package(deck)
+        if media_files: pkg.media_files = media_files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".apkg") as tmp:
+            pkg.write_to_file(tmp.name)
+            with open(tmp.name, "rb") as f:
+                apkg_bytes = f.read()
+        return apkg_bytes
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 # -------------------------
 # Preview & stats functions
@@ -705,7 +739,7 @@ def render_card_preview(c: Dict[str, Any], lang: str) -> str:
 def ss_init(k, v):
     if k not in st.session_state: st.session_state[k] = v
 for k,v in [
-    ("messages",),
+    ("messages", []),
     ("topic", ""),
     ("deck_title", ""),
     ("goal", "Language: Vocabulary"),
@@ -716,16 +750,16 @@ for k,v in [
     ("max_qa_pct", 0.45),
     ("require_anchor", True),
     ("default_tag", ""),
-    ("materials",),
+    ("materials", []),
     ("urls_text", ""),
     ("youtube_urls_text", ""),
     ("digest", ""),
-    ("chosen_sections_meta",),
-    ("domain_kws",),
+    ("chosen_sections_meta", []),
+    ("domain_kws", []),
     ("assessment", None),
     ("assessment_ok", False),
-    ("preview_cards",),
-    ("approved_cards",),
+    ("preview_cards", []),
+    ("approved_cards", []),
     ("tts_mode", "examples"),
     ("tts_cov", "sampled"),
     ("manual_mode", False),
@@ -750,7 +784,7 @@ with st.expander("📎 (Optional) Add materials for better anchoring"):
     colm1, colm2 = st.columns(2)
     if colm1.button("Add sources"):
         with st.spinner("Processing sources..."):
-            mats = ingest_files(upl) if upl else
+            mats = ingest_files(upl) if upl else []
             if url_lines.strip():
                 st.session_state.urls_text = url_lines
                 urls = [u.strip() for u in url_lines.splitlines() if u.strip()]
@@ -766,9 +800,9 @@ with st.expander("📎 (Optional) Add materials for better anchoring"):
             else:
                 st.toast("No new sources added.", icon="ℹ️")
     if colm2.button("Clear sources"):
-        st.session_state.materials =
+        st.session_state.materials = []
         st.session_state.digest = ""
-        st.session_state.chosen_sections_meta =
+        st.session_state.chosen_sections_meta = []
         st.toast("Sources cleared.", icon="🗑️")
 
 user_text = st.chat_input("Describe your topic, ask for preview, or say 'build deck'. You can also say 'set size 80', 'language en-US', etc.")
@@ -810,12 +844,16 @@ if user_text:
             st.session_state.max_qa_pct, st.session_state.require_anchor
         )
         st.session_state.assessment = a
-        plan_md =)[:10]],
+        plan_md = [
+            "**Assessment Plan**",
+            f"**Summary:** {a.get('summary','(no summary)')}",
+            "**Key issues:**",
+            *[f"- {x}" for x in a.get('key_issues', []) or ['(none)']],
             "**Card type strategy (%):**",
             f"`{json.dumps(a.get('card_type_strategy',{}))}`",
             f"**Anchoring:** {a.get('anchoring_plan','')}",
             "**Open questions:**",
-            *[f"- {x}" for x in a.get("open_questions",) or ['(none)']],
+            *[f"- {x}" for x in a.get('open_questions', []) or ['(none)']],
             "_Reply with changes (e.g., 'more cloze on exceptions', 'add scenarios', 'reduce Q&A'), or say **preview** / **build**._"
         ]
         say("assistant", "\n".join(plan_md))
@@ -845,14 +883,14 @@ def make_payload(n_cards: int, seed_cards=None):
         "require_anchor": require_anchor_effective(),
         "domain_keywords": st.session_state.domain_kws[:30],
         "user_feedback": "",
-        "seed_cards": seed_cards or,
+        "seed_cards": seed_cards or [],
         "assessment_plan": st.session_state.assessment or {},
         "assessment_approved": bool(st.session_state.assessment_ok),
     }
 def build_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = gerar_baralho(payload)
-    cards = dedupe_cards(data.get("cards",))
-    seed_ids = {c.get("id") for c in payload.get("seed_cards",) if c.get("id")}
+    cards = dedupe_cards(data.get("cards",[]))
+    seed_ids = {c.get("id") for c in payload.get("seed_cards",[]) if c.get("id")}
     cards = enforce_variety(cards, st.session_state.domain_kws, payload["max_qa_pct"], payload["require_anchor"], seed_ids)
     data["cards"] = cards[: payload["limite_cartoes"]]
     data["deck"]["card_count_planned"] = len(data["cards"])
@@ -865,7 +903,7 @@ if st.session_state.get("pending_preview") or do_preview:
         with st.spinner("Drafting preview…"):
             payload = make_payload(prev_size)
             data = build_sample(payload)
-            st.session_state.preview_cards = data.get("cards",)
+            st.session_state.preview_cards = data.get("cards",[])
             stats = deck_stats(st.session_state.preview_cards, st.session_state.domain_kws)
             say("assistant",
                 f"Preview ready ({len(st.session_state.preview_cards)} cards). "
@@ -883,7 +921,7 @@ if st.session_state.preview_cards:
     if pd:
         st.markdown("**Approve / edit preview** *(kept rows become seed cards for the final deck)*")
         def cards_to_df(cards):
-            rows =
+            rows = []
             for c in cards:
                 rows.append({
                     "keep": True,
@@ -891,11 +929,11 @@ if st.session_state.preview_cards:
                     "front": strip_html_to_plain(c.get("front") or c.get("Text","")),
                     "back":  strip_html_to_plain(c.get("back") or c.get("BackExtra","")),
                     "hint": c.get("hint",""),
-                    "tags": ",".join(sanitize_tags(c.get("tags",)))
+                    "tags": ",".join(sanitize_tags(c.get("tags",[])))
                 })
             return pd.DataFrame(rows)
         def df_to_cards(df):
-            out =
+            out = []
             for _,r in df.iterrows():
                 if not r.get("keep",False): continue
                 tags = sanitize_tags([t.strip() for t in str(r.get("tags","")).split(",") if t.strip()])
@@ -906,7 +944,7 @@ if st.session_state.preview_cards:
                     "front": normalize_text_for_html(r["front"], cloze=(r["type"]=="cloze")),
                     "back":  normalize_text_for_html(r["back"]),
                     "hint":  html_escape(r.get("hint","")),
-                    "examples":,
+                    "examples": [],
                     "tags": tags,
                     "source_ref": {}, "rationale": ""
                 })
@@ -920,12 +958,12 @@ if st.session_state.get("pending_build") or do_build:
         say("assistant", "Please describe a topic first.")
     else:
         with st.spinner("Building your deck…"):
-            seeds = st.session_state.approved_cards or
+            seeds = st.session_state.approved_cards or []
             remain = max(0, st.session_state.target_n - len(seeds))
             if remain > 0:
                 payload = make_payload(remain, seed_cards=seeds)
                 data = gerar_baralho(payload)
-                more = dedupe_cards(data.get("cards",))
+                more = dedupe_cards(data.get("cards",[]))
                 seed_ids = {c.get("id") for c in seeds if c.get("id")}
                 more = enforce_variety(more, st.session_state.domain_kws, payload["max_qa_pct"], payload["require_anchor"], seed_ids)
                 cards = dedupe_cards(seeds + more)[: st.session_state.target_n]
@@ -985,7 +1023,8 @@ with st.sidebar:
         if colM1.button("Preview (manual)"):
             payload = make_payload(10)
             data = build_sample(payload)
-            st.session_state.preview_cards = data.get("cards",)
+            st.session_state.preview_cards = data.get("cards",[])
         if colM2.button("Build (manual)"):
             st.session_state.pending_build = True
             st.experimental_rerun()
+```
