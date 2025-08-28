@@ -496,7 +496,8 @@ def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float,
             continue
         filtered.append(c)
     if not filtered:
-        return []
+    # Fall back instead of returning zero — preserves preview UX
+    return cards
     total = max(1, len(filtered))
     qa_idx = [i for i, c in enumerate(filtered) if kind_of(c) == "qa" and c.get("id") not in seed_ids]
     max_qa = int(max_qa_frac * total)
