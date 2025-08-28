@@ -1,5 +1,5 @@
-import os, io, json, time, tempfile, hashlib, re, random
-from typing import List, Dict, Any, Optional
+import os, io, json, time, tempfile, hashlib, re, random, textwrap
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -11,8 +11,33 @@ from pypdf import PdfReader
 import docx as docxlib
 from unidecode import unidecode
 
+# Optional deps (best-effort)
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    try:
+        from readability import Document  # readability-lxml
+    except Exception:
+        Document = None
+except Exception:
+    requests = None
+    BeautifulSoup = None
+    Document = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
 # =========================
-# CONFIG GERAL
+# CONFIG & GLOBALS
 # =========================
 st.set_page_config(page_title="Anki-Generator", page_icon="🧠", layout="wide")
 
@@ -21,30 +46,33 @@ if not OPENAI_API_KEY:
     st.error("Defina OPENAI_API_KEY nos Secrets (Streamlit) ou variável de ambiente.")
     st.stop()
 
-# Client com timeout para não travar
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 
-# Robustez
-TEXT_MODEL = "gpt-4o-mini"   # troque se quiser
-STRICT_MAX_ROUNDS = 4        # rodadas de complemento
-STRICT_BATCH = 20            # cartões por rodada
-STRICT_HARD_TIMEOUT = 180    # seg totais no modo estrito
-MAX_AUDIO_FILES = 24         # limite de áudios por deck
-AUDIO_CHAR_LIMIT = 400       # limite de chars no TTS
+TEXT_MODEL = "gpt-4o-mini"
+STRICT_MAX_ROUNDS_DEFAULT = 4
+STRICT_BATCH_DEFAULT = 20
+STRICT_HARD_TIMEOUT = 180
+MAX_AUDIO_FILES = 24
+AUDIO_CHAR_LIMIT = 400
 
+# =========================
+# PROMPT (with feedback + Flashcard Guide)
+# =========================
 SYSTEM_PROMPT = """
 Você é uma IA especialista em Design Instrucional e Ciência Cognitiva, integrada ao 'Anki-Generator'.
 
 OBJETIVO
 - Gerar cartões úteis, específicos e de alta qualidade, ancorados no tópico e nos materiais do usuário (quando houver).
-- Práticas baseadas em evidência: recordação ativa, conhecimento atômico, exemplos concretos, interleaving/variação, contraste/erro comum, foco em transferência.
+- Práticas baseadas em evidência: recordação ativa, conhecimento atômico, exemplos concretos, interleaving/variação, contraste/erro comum, foco em transferência para uso real.
+
+CONSIDERE feedback do usuário (payload.user_feedback), quando presente, para ajustar foco, granularidade, estilo, exemplos, tipos de cartão, âncoras e cobertura.
 
 FINS (payload.goal)
 - "General learning": equilíbrio entre definição, cloze, cenários e procedimentos.
 - "Org policy mastery": foque itens práticos: seções/IDs, prazos, thresholds/valores, exceções, responsáveis, aprovações, sanções, conformidade, auditoria, SLA/OLA. Muitos cenários e procedimentos.
 - "Exam prep": foco em pontos cobrados/pegadinhas/variações; >=30% cloze, >=20% cenários; inclua erros comuns.
 - "Language: Vocabulary": collocations, regência/partículas, falsos cognatos; cloze de palavras, exemplos bilíngues, frase de uso; audio_script apropriado.
-- "Language: Grammar & Patterns": contraste de padrões, cloze morfossintático, condições e restrições; exemplos mínimos; audio_script com frases-alvo.
+- "Language: Grammar & Patterns": contraste de padrões, cloze morfossintático, condições/restrições; exemplos mínimos; audio_script com frases-alvo.
 - "Language: Listening-Pronunciation": priorize áudio, IPA quando aplicável; cloze auditiva (palavra/chunk); script natural.
 - "Language: Reading-CEFR": cloze de conectores, tempos, referência pronominal; microtrechos com inferência.
 
@@ -70,18 +98,18 @@ Parte 1 – Princípios (As 20 Regras)
 7) Promova recordação ativa (Q/cloze > reconhecimento). 8) Resposta rápida (2–5s).
 9) Foco em conhecimento estável. 10) Conceitos precisos; evite vagos.
 11) Reescreva com suas palavras (clareza). 12) Exemplos p/ ideias abstratas.
-13) Pistas mínimas somente quando necessárias (hint curto). 14) Estruture em camadas (do básico ao complexo).
+13) Pistas mínimas somente quando necessárias (hint curto). 14) Estruture em camadas (básico→complexo).
 15) Quebre assuntos grandes em subcartões. 16) Não confunda reconhecimento com recall.
-17) Cloze com sabedoria (um alvo por cloze). 18) Refine cartões ruins (indique notas no qa_report).
-19) Personalize aos objetivos do usuário (payload.goal). 20) Teste para uso real (contextos/autênticos).
+17) Cloze com sabedoria (um alvo por cloze). 18) Refine cartões ruins (marque no qa_report).
+19) Personalize aos objetivos do usuário (payload.goal). 20) Teste para uso real (contextos autênticos).
 
 Parte 2 – Técnicas
-- Basic Q&A: melhor para fatos simples (curtos).
+- Basic Q&A: fatos simples e curtos.
 - Cloze deletion: palavra-chave/termo/número/cláusula em contexto.
 - Reverse cards: opcional quando reforça bidirecionalidade.
 - Step-by-step process: um passo por cartão (ordem/quem faz/prazo).
-- Component/part: para listas, teste itens individualmente.
-- Cause-effect: “Se X, então Y” (resultados, condições).
+- Component/part: listas → itens individuais.
+- Cause-effect: “Se X, então Y” (condições/efeitos).
 - Comparison/contrast: diferenças essenciais (diagnóstico).
 
 Parte 3 – Erros a evitar
@@ -89,9 +117,8 @@ Parte 3 – Erros a evitar
 - Múltipla escolha em excesso; não editar cartões ruins; contexto demais; redação confusa.
 
 Parte 4 – Modelos de boa pergunta
-- “O que é X?” (definição); “X é Y?”/“X tem quantos Y?” (fato simples);
-- “Se X, então Y?” (causa-efeito); “Por que X?” (causal);
-- “Quais componentes de X?” (listas → dividir); “O que acontece em X?” (processo).
+- “O que é X?”; “X tem quantos Y?”; “Se X, então Y?”; “Por que X?”;
+- “Quais componentes de X?”; “O que acontece em X?”.
 
 SAÍDA (OBRIGATÓRIO)
 - JSON:
@@ -110,7 +137,7 @@ SAÍDA (OBRIGATÓRIO)
 """
 
 # =========================
-# UTILS
+# UTILITÁRIOS
 # =========================
 def slugify(text: str, maxlen: int = 64) -> str:
     t = unidecode(text or "").lower()
@@ -123,7 +150,6 @@ def html_escape(s: Optional[str]) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
 def normalize_text_for_html(s: str, cloze: bool = False) -> str:
-    """Remove cercas e converte \\n em <br>. Se cloze=True, preserva {{c1::...}}."""
     if s is None: return ""
     s = str(s).strip()
     s = re.sub(r"^```[\s\S]*?\n|```$", "", s)
@@ -154,7 +180,7 @@ def examples_to_html(examples: Optional[List[Dict[str, Any]]]) -> str:
         items.append(f"<li>{line}</li>")
     return "<ul class='examples-list'>" + "".join(items) + "</ul>"
 
-# gTTS mapping
+# gTTS helpers
 def map_lang_for_gtts(language_code: str) -> str:
     langs = tts_langs()
     if not language_code: return "en"
@@ -182,7 +208,7 @@ def synth_audio(text: str, lang_code: str) -> Optional[bytes]:
     except Exception:
         return None
 
-# genanki tags
+# tags
 def _clean_tag(tag) -> str:
     t = str(tag or "").strip().lower()
     t = re.sub(r"\s+", "-", t)
@@ -199,7 +225,7 @@ def sanitize_tags(tags) -> list:
         if len(out) >= 12: break
     return out
 
-# --- heurística Q/A & rótulos ---
+# Q/A heuristic
 QUESTION_WORDS = {
     "fr": ["qui","que","quoi","quel","quelle","quels","quelles","où","quand","comment","pourquoi","combien"],
     "pt": ["o que","qual","quais","quando","onde","como","por que","por quê","quem","quanto","quantos","quantas"],
@@ -223,8 +249,7 @@ def looks_like_question(text: str, lang: str) -> bool:
     w = re.sub(r'^[\-\•\–\s]+', '', t.lower())
     return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp, []))
 
-def orient_q_a(card: dict, lang: str) -> tuple[str, str]:
-    """Pergunta → Resposta; se nada parecer pergunta, lado mais curto é a frente."""
+def orient_q_a(card: dict, lang: str) -> Tuple[str, str]:
     f = (card.get("front") or card.get("Text") or "").strip()
     b = (card.get("back")  or card.get("BackExtra") or "").strip()
     fq, bq = looks_like_question(f, lang), looks_like_question(b, lang)
@@ -248,7 +273,7 @@ def extra_label(kind: str, lang: str) -> str:
     return {"usage_tip":"Usage tip:", "common_pitfall":"Common pitfall:", "mnemonic":"Mnemonic:", "self_check":"Self-check:", "source":"Source:", "none":""}.get(kind,"")
 
 # =========================
-# INGESTÃO DE ARQUIVOS
+# INGESTÃO DE ARQUIVOS & URLS
 # =========================
 def extract_pdf(file_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -280,7 +305,96 @@ def ingest_files(uploaded_files) -> List[Dict[str, Any]]:
         mats.append({"file": name, "content": text})
     return mats
 
-def compress_materials(materials: List[Dict[str, Any]], max_chars: int = 12000) -> str:
+def fetch_url_text(url: str, timeout: int = 25) -> str:
+    if not requests: return ""
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"anki-generator/1.0"})
+        r.raise_for_status()
+        html = r.text
+        if Document:
+            try:
+                doc = Document(html)
+                content = doc.summary(html_partial=False)
+                soup = BeautifulSoup(content, "html.parser")
+                return soup.get_text("\n", strip=True)
+            except Exception:
+                pass
+        if BeautifulSoup:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script","style","noscript"]): tag.decompose()
+            return soup.get_text("\n", strip=True)
+        return html
+    except Exception:
+        return ""
+
+def ingest_urls(urls: List[str]) -> List[Dict[str, Any]]:
+    mats = []
+    for u in urls:
+        u = u.strip()
+        if not u: continue
+        txt = fetch_url_text(u)
+        if txt:
+            name = re.sub(r"^https?://", "", u)[:80]
+            mats.append({"file": name, "content": txt})
+    return mats
+
+def split_sections(text: str, file_name: str) -> List[Dict[str, Any]]:
+    """Split by markdown headers or large paragraphs."""
+    sections = []
+    # split by headers
+    parts = re.split(r"\n(?=#+\s)|\n(?=\[p\.\d+\])", text)
+    for i, part in enumerate(parts):
+        pt = part.strip()
+        if not pt: continue
+        title = None
+        m = re.match(r"^(#+\s.*)", pt)
+        if m: title = m.group(1)
+        elif pt.lower().startswith("[p."):
+            title = pt.split("\n",1)[0]
+        else:
+            title = f"{file_name} — sec {i+1}"
+        sections.append({"file": file_name, "title": title, "content": pt[:4000]})
+    return sections or [{"file": file_name, "title": f"{file_name} — full", "content": text[:4000]}]
+
+def simple_keyword_rank(query: str, sections: List[Dict[str, Any]], top_k: int = 6) -> List[int]:
+    q_toks = set(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,}", query.lower()))
+    scores = []
+    for i, s in enumerate(sections):
+        txt = s["content"].lower()
+        score = sum(1 for t in q_toks if t in txt)
+        scores.append((score, i))
+    scores.sort(reverse=True)
+    return [i for _, i in scores[:top_k]]
+
+def tfidf_rank(query: str, sections: List[Dict[str, Any]], top_k: int = 6) -> List[int]:
+    docs = [s["content"] for s in sections]
+    try:
+        vec = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.9)
+        X = vec.fit_transform(docs)
+        qv = vec.transform([query])
+        sims = cosine_similarity(qv, X).ravel()
+        top = sims.argsort()[::-1][:top_k]
+        return top.tolist()
+    except Exception:
+        return simple_keyword_rank(query, sections, top_k)
+
+def rag_digest(materials: List[Dict[str, Any]], topic: str, user_feedback: str, top_k: int = 6, max_chars: int = 12000) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return a condensed digest built from top-k relevant sections + sections meta."""
+    if not materials: return "", []
+    sections = []
+    for m in materials:
+        sections.extend(split_sections(m["content"], m["file"]))
+    query = f"{topic}\n{user_feedback}".strip()
+    idxs = tfidf_rank(query, sections, top_k) if SKLEARN_OK else simple_keyword_rank(query, sections, top_k)
+    chosen = [sections[i] for i in idxs]
+    parts = []
+    for s in chosen:
+        hdr = f"# {s['file']} — {s['title']}"
+        parts.append(hdr + "\n" + s["content"])
+    digest = "\n\n".join(parts)
+    return digest[:max_chars], chosen
+
+def compress_materials_simple(materials: List[Dict[str, Any]], max_chars: int = 12000) -> str:
     if not materials: return ""
     parts = []; per = max_chars // max(1, len(materials))
     for m in materials:
@@ -289,50 +403,66 @@ def compress_materials(materials: List[Dict[str, Any]], max_chars: int = 12000) 
     return "\n\n".join(parts)[:max_chars]
 
 # =========================
-# GOAL → mix minima
+# MIX MINIMA (goal & overrides)
 # =========================
 def goal_mix_minima(goal: str) -> Dict[str, float]:
     g = (goal or "").lower()
-    # percentuais mínimos do conjunto atual (ajustados por boas práticas)
-    if "policy" in g:
-        return {"cloze": 0.25, "scenario": 0.35, "procedure": 0.25}
-    if "exam prep" in g:
-        return {"cloze": 0.30, "scenario": 0.20, "procedure": 0.15}
-    if "vocabulary" in g:
-        return {"cloze": 0.35, "scenario": 0.05, "procedure": 0.00}
-    if "grammar" in g or "patterns" in g:
-        return {"cloze": 0.50, "scenario": 0.10, "procedure": 0.00}
-    if "listening" in g or "pronunciation" in g:
-        return {"cloze": 0.30, "scenario": 0.10, "procedure": 0.00}
-    if "reading" in g or "cefr" in g:
-        return {"cloze": 0.40, "scenario": 0.10, "procedure": 0.00}
-    # General learning default
+    if "policy" in g: return {"cloze": 0.25, "scenario": 0.35, "procedure": 0.25}
+    if "exam prep" in g: return {"cloze": 0.30, "scenario": 0.20, "procedure": 0.15}
+    if "vocabulary" in g: return {"cloze": 0.35, "scenario": 0.05, "procedure": 0.00}
+    if "grammar" in g or "patterns" in g: return {"cloze": 0.50, "scenario": 0.10, "procedure": 0.00}
+    if "listening" in g or "pronunciation" in g: return {"cloze": 0.30, "scenario": 0.10, "procedure": 0.00}
+    if "reading" in g or "cefr" in g: return {"cloze": 0.40, "scenario": 0.10, "procedure": 0.00}
     return {"cloze": 0.30, "scenario": 0.20, "procedure": 0.15}
 
 # =========================
-# OPENAI → GERAÇÃO (básico)
+# OPENAI WRAPPER + JSON SAFE
 # =========================
+def chat_json(messages, model=TEXT_MODEL, temperature=0, max_tries=4):
+    last_err = None
+    for i in range(max_tries):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                response_format={"type":"json_object"},
+            )
+            return resp
+        except Exception as e:
+            last_err = e
+            time.sleep(min(8, 2**i + random.random()))
+    raise last_err
+
 def _safe_json(content: str) -> dict:
     try:
         return json.loads(content)
     except Exception:
         return {}
 
+REQUIRED_CARD_FIELDS = {"type","front","back"}
+def valid_card(c: dict) -> bool:
+    if not isinstance(c, dict): return False
+    typ = (c.get("type") or "").lower()
+    if typ == "cloze":
+        c.setdefault("front", c.get("Text",""))
+        c.setdefault("back",  c.get("BackExtra",""))
+    if not all(k in c for k in REQUIRED_CARD_FIELDS): return False
+    if len(strip_html_to_plain(c.get("back",""))) > 360:  # fast-answer heuristic
+        return False
+    return True
+
 def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
-    resp = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user","content":json.dumps(payload, ensure_ascii=False)}
-        ],
-        temperature=0,
-        response_format={"type":"json_object"}
+    resp = chat_json(
+        [{"role":"system","content":SYSTEM_PROMPT},
+         {"role":"user","content":json.dumps(payload, ensure_ascii=False)}],
+        model=TEXT_MODEL, temperature=0
     )
     data = _safe_json(resp.choices[0].message.content or "{}")
     cards = data.get("cards", [])
     if not isinstance(cards, list): cards = []
+    cards = [c for c in cards if valid_card(c)]
 
-    # Normalização
     for c in cards:
         if not isinstance(c, dict): continue
         ctype = (c.get("type") or "basic").lower()
@@ -346,16 +476,19 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
             c["back"]  = normalize_text_for_html(c.get("back",""))
 
     data.setdefault("deck", {})
-    data["deck"].setdefault("title", "Anki-Generator Deck")
+    data["deck"].setdefault("title", payload.get("deck_title","Anki-Generator Deck"))
     data["deck"].setdefault("language", payload.get("idioma_alvo","en"))
     data["deck"].setdefault("level", payload.get("nivel_proficiencia",""))
     data["deck"].setdefault("topic", payload.get("topico",""))
     data["deck"]["card_count_planned"] = len(cards)
     data["cards"] = cards
+
+    if hasattr(resp, "usage"):
+        st.caption(f"Tokens — prompt: {resp.usage.prompt_tokens}, completion: {resp.usage.completion_tokens}")
     return data
 
 # =========================
-# VARIEDADE/ÂNCORA: keywords & filtros
+# VARIEDADE/ÂNCORA & DEDUPE
 # =========================
 STOPWORDS = set("""
 a an and the of de da do dos das para por com sem em no na nos nas um uma umas uns que quem como quando onde porque porquê se então or ou e not não ao aos às à pela pelo pelos pelas este esta isto esse essa isso aquele aquela aquilo entre sobre até desde contra sob além cada mais menos muito muita muitos muitas pouco pouca poucos poucas ser estar ter haver foi são eram será deverá deveráo dever deverá deverão pode podem não sim
@@ -390,43 +523,13 @@ def contains_domain_keyword(card: dict, kws: List[str]) -> bool:
     blob = f"{card.get('front','')} || {card.get('back','')}".lower()
     return any(k in blob for k in kws[:40])
 
-def enforce_mix_and_anchoring(cards: List[dict], kws: List[str], require_anchor: bool, max_qa_frac: float, minima_pct: Dict[str,float]) -> (List[dict], dict):
-    """Filtra genéricos e não ancorados; limita Q&A; calcula necessidades por tipo."""
-    if not isinstance(cards, list): cards = []
-    # 1) filtro
-    filtered = []
-    for c in cards:
-        if require_anchor and not anchored_to_source(c):
-            continue
-        if not contains_domain_keyword(c, kws):
-            continue
-        filtered.append(c)
+def jaccard_near_dup(a: str, b: str, threshold: float = 0.85) -> bool:
+    ta=set(re.findall(r"\w+", strip_html_to_plain(a.lower())))
+    tb=set(re.findall(r"\w+", strip_html_to_plain(b.lower())))
+    if not ta or not tb: return False
+    j = len(ta&tb)/max(1,len(ta|tb))
+    return j > threshold
 
-    if not filtered:
-        return [], {"cloze_min":0,"scenario_min":0,"procedure_min":0}
-
-    # 2) limitar Q&A
-    total = max(1, len(filtered))
-    qa_cards = [c for c in filtered if card_kind(c) == "qa"]
-    max_qa = int(max_qa_frac * total)
-    if len(qa_cards) > max_qa:
-        qa_sorted = sorted(qa_cards, key=lambda c: len(c.get("front","")))
-        to_remove = set(id(x) for x in qa_sorted[max_qa:])
-        filtered = [c for c in filtered if id(c) not in to_remove]
-        total = max(1, len(filtered))
-
-    # 3) necessidades por tipo (percentuais mínimos)
-    kinds = [card_kind(c) for c in filtered]
-    need = {
-        "cloze_min": max(0, int(minima_pct.get("cloze",0)*total) - kinds.count("cloze")),
-        "scenario_min": max(0, int(minima_pct.get("scenario",0)*total) - kinds.count("scenario")),
-        "procedure_min": max(0, int(minima_pct.get("procedure",0)*total) - kinds.count("procedure")),
-    }
-    return filtered, need
-
-# =========================
-# DEDUPE + TOP-UP (modo estrito com TIMEOUT)
-# =========================
 def _card_signature(card: dict) -> str:
     t = (card.get("type") or "").lower().strip()
     f = (card.get("front") or card.get("Text") or "").strip().lower()
@@ -439,26 +542,66 @@ def dedupe_cards(cards: list) -> list:
         if not isinstance(c, dict): continue
         sig = _card_signature(c)
         if sig in seen: continue
+        # near-dup check vs small sample of existing
+        is_nd = False
+        for d in out[-50:]:
+            if jaccard_near_dup((c.get("front",""))+(c.get("back","")),
+                                (d.get("front",""))+(d.get("back",""))):
+                is_nd = True; break
+        if is_nd: continue
         seen.add(sig); out.append(c)
     return out
 
-def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lote: int = STRICT_BATCH) -> list:
-    novos_total = []; restantes = max(0, int(faltantes))
+def enforce_mix_and_anchoring(cards: List[dict], kws: List[str], require_anchor: bool,
+                              max_qa_frac: float, minima_pct: Dict[str,float],
+                              seed_ids: Optional[set] = None) -> Tuple[List[dict], dict]:
+    seed_ids = seed_ids or set()
+    filtered = []
+    for c in cards:
+        if require_anchor and not anchored_to_source(c) and c.get("id") not in seed_ids:
+            continue
+        if not contains_domain_keyword(c, kws) and c.get("id") not in seed_ids:
+            continue
+        filtered.append(c)
 
+    if not filtered:
+        return [], {"cloze_min":0,"scenario_min":0,"procedure_min":0}
+
+    total = max(1, len(filtered))
+    qa_cards_idx = [i for i,c in enumerate(filtered) if card_kind(c)=="qa" and c.get("id") not in seed_ids]
+    max_qa = int(max_qa_frac * total)
+    if len(qa_cards_idx) > max_qa:
+        # Remove shortest-front QAs first (non-seed)
+        qa_sorted = sorted(qa_cards_idx, key=lambda i: len((filtered[i].get("front",""))))
+        to_remove = set(qa_sorted[max_qa:])
+        filtered = [c for i,c in enumerate(filtered) if i not in to_remove]
+
+    kinds = [card_kind(c) for c in filtered]
+    need = {
+        "cloze_min": max(0, int(minima_pct.get("cloze",0)*len(filtered)) - kinds.count("cloze")),
+        "scenario_min": max(0, int(minima_pct.get("scenario",0)*len(filtered)) - kinds.count("scenario")),
+        "procedure_min": max(0, int(minima_pct.get("procedure",0)*len(filtered)) - kinds.count("procedure")),
+    }
+    return filtered, need
+
+# =========================
+# TOP-UP (STRICT MODE)
+# =========================
+def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lote: int) -> list:
     resumo = []
     for c in ja_gerados or []:
         resumo.append({"type": c.get("type"),
                        "front": c.get("front") or c.get("Text"),
                        "back":  c.get("back")  or c.get("BackExtra"),
                        "tags":  c.get("tags", [])})
+    pedir = min(max(0,int(faltantes)), int(lote))
+    if pedir <= 0: return []
 
-    pedir = min(restantes, lote)
     sys_addendum = (
         SYSTEM_PROMPT +
         "\n\nINSTRUÇÃO ADICIONAL: Gere EXATAMENTE o número solicitado e responda SOMENTE com JSON no formato "
         '{"cards":[{...}]}' " (sem 'deck' e sem 'qa_report'). Não repita cartões existentes."
     )
-
     mix_targets = payload.get("mix_targets", {})
     sys_addendum += (
         f"\n\nPRIORIZAR NESTA RODADA (se aplicável): "
@@ -471,7 +614,7 @@ def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lo
     )
 
     pedido = {
-        "pedido": f"Gerar exatamente {pedir} novos cartões NÃO-DUPLICADOS, variados (cloze/cenário/procedimento/definição-criterial), mantendo active recall e atômicos.",
+        "pedido": f"Gerar exatamente {pedir} cartões NÃO-DUPLICADOS, variados (cloze/cenário/procedimento/definição-criterial), mantendo active recall e atômicos.",
         "payload_base": {
             "idioma_alvo": payload.get("idioma_alvo"),
             "nivel_proficiencia": payload.get("nivel_proficiencia"),
@@ -484,25 +627,23 @@ def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lo
             "domain_keywords": payload.get("domain_keywords", []),
             "require_anchor": payload.get("require_anchor", True),
             "max_qa_pct": payload.get("max_qa_pct", 0.5),
-            "mix_targets": payload.get("mix_targets", {})
+            "mix_targets": payload.get("mix_targets", {}),
+            "user_feedback": payload.get("user_feedback","")
         },
         "cartoes_ja_gerados_resumo": resumo
     }
 
-    resp = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[{"role":"system","content":sys_addendum},
-                  {"role":"user","content":json.dumps(pedido, ensure_ascii=False)}],
-        temperature=0,
-        response_format={"type":"json_object"}
+    resp = chat_json(
+        [{"role":"system","content":sys_addendum},
+         {"role":"user","content":json.dumps(pedido, ensure_ascii=False)}],
+        model=TEXT_MODEL, temperature=0
     )
     data = _safe_json(resp.choices[0].message.content or "{}")
     novos = data.get("cards", [])
     if not isinstance(novos, list): novos = []
+    novos = [c for c in novos if valid_card(c)]
 
-    # normaliza
     for c in novos:
-        if not isinstance(c, dict): continue
         typ = (c.get("type") or "basic").lower()
         if typ == "cloze":
             if not c.get("front") and c.get("Text"): c["front"] = c["Text"]
@@ -512,35 +653,36 @@ def gerar_cartoes_adicionais(payload: dict, ja_gerados: list, faltantes: int, lo
         else:
             c["front"] = normalize_text_for_html(c.get("front",""))
             c["back"]  = normalize_text_for_html(c.get("back",""))
+    return novos[:pedir]
 
-    return novos[:faltantes]
-
-def gerar_baralho_estrito(payload: dict, progress=None) -> dict:
+def gerar_baralho_estrito(payload: dict, progress=None, max_rounds: int = STRICT_MAX_ROUNDS_DEFAULT, batch_size: int = STRICT_BATCH_DEFAULT) -> dict:
     start = time.time()
     desired = int(payload.get("limite_cartoes", 20))
+    seed_cards = payload.get("seed_cards", []) or []
     base = gerar_baralho(payload)
-    cards = dedupe_cards(base.get("cards", []))
+    cards = dedupe_cards(seed_cards + base.get("cards", []))
 
-    # Primeira filtragem e metas por tipo
     kws = payload.get("domain_keywords", [])
-    minima_pct = goal_mix_minima(payload.get("goal","General learning"))
-    cards, need = enforce_mix_and_anchoring(cards, kws, payload.get("require_anchor", True), payload.get("max_qa_pct", 0.5), minima_pct)
+    minima_pct = payload.get("minima_overrides") or goal_mix_minima(payload.get("goal","General learning"))
+
+    seed_ids = {c.get("id") for c in seed_cards if c.get("id")}
+    cards, need = enforce_mix_and_anchoring(cards, kws, payload.get("require_anchor", True),
+                                            payload.get("max_qa_pct", 0.5), minima_pct, seed_ids)
 
     if progress: progress.progress(min(0.1, len(cards)/max(1, desired)))
     rounds = 0
 
-    while len(cards) < desired and rounds < STRICT_MAX_ROUNDS:
-        if time.time() - start > STRICT_HARD_TIMEOUT:
-            break
+    while len(cards) < desired and rounds < max_rounds:
+        if time.time() - start > STRICT_HARD_TIMEOUT: break
         faltam = desired - len(cards)
         payload["mix_targets"] = need
-        novos = gerar_cartoes_adicionais(payload, cards, faltam, lote=STRICT_BATCH)
+        novos = gerar_cartoes_adicionais(payload, cards, faltam, lote=batch_size)
 
         prev = len(cards)
         draft = dedupe_cards(cards + novos)
-        draft, need = enforce_mix_and_anchoring(draft, kws, payload.get("require_anchor", True), payload.get("max_qa_pct", 0.5), minima_pct)
+        draft, need = enforce_mix_and_anchoring(draft, kws, payload.get("require_anchor", True),
+                                                payload.get("max_qa_pct", 0.5), minima_pct, seed_ids)
         cards = draft
-
         rounds += 1
         if progress:
             frac = min(0.95, len(cards) / max(1, desired) * 0.9 + 0.05)
@@ -550,12 +692,13 @@ def gerar_baralho_estrito(payload: dict, progress=None) -> dict:
 
     base["cards"] = cards[:desired]
     base.setdefault("deck", {})
+    base["deck"]["title"] = payload.get("deck_title", base["deck"].get("title","Anki-Generator Deck"))
     base["deck"]["card_count_planned"] = len(base["cards"])
     if progress: progress.progress(1.0)
     return base
 
 # =========================
-# ANKI (genanki) — MODELOS v3
+# ANKI MODELS (v3)
 # =========================
 def stable_model_id(name: str, version: int = 3) -> int:
     h = hashlib.sha1(f"{name}-v{version}".encode("utf-8")).hexdigest()
@@ -647,7 +790,13 @@ def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str
         if t: return t
     return None
 
-def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", extra_kind: str = "usage_tip") -> bytes:
+def build_apkg_bytes(
+    deck_json: Dict[str, Any],
+    tts_policy: str = "exemplos",
+    extra_kind: str = "usage_tip",
+    tts_coverage: str = "sampled",   # "sampled" | "all"
+    default_tag: str = ""
+) -> bytes:
     meta = deck_json.get("deck", {})
     cards = deck_json.get("cards", [])
     title = meta.get("title","Anki-Generator Deck")
@@ -657,19 +806,18 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
     media_files: List[str] = []
     tmpdir = tempfile.mkdtemp(prefix="anki_media_")
 
-    # TTS: escolha aleatória até MAX_AUDIO_FILES cartões
     idxs_for_audio = set()
     if tts_policy != "nenhuma" and len(cards) > 0:
-        idxs_for_audio = set(random.sample(range(len(cards)), min(MAX_AUDIO_FILES, len(cards))))
+        if tts_coverage.lower().startswith("all"):
+            idxs_for_audio = set(range(len(cards)))
+        else:
+            idxs_for_audio = set(random.sample(range(len(cards)), min(MAX_AUDIO_FILES, len(cards))))
 
     def add_note(c: Dict[str, Any], index: int):
         ctype = (c.get("type") or "basic").lower()
-        if ctype == "reverse": ctype = "basic"  # render como basic
-
         hint = html_escape(c.get("hint") or "")
         examples_html = examples_to_html(c.get("examples"))
 
-        # EXTRA
         extra_bits = []
         src = c.get("source_ref") or {}
         extra_txt = (c.get("rationale") or "").strip()
@@ -686,7 +834,7 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
 
         extra = "".join(extra_bits)
 
-        # ÁUDIO
+        # audio
         audio_field = ""
         front_raw, back_raw = orient_q_a(c, lang)
         if index in idxs_for_audio:
@@ -699,23 +847,24 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
                     media_files.append(mp3_path)
                     audio_field = f"[sound:{os.path.basename(mp3_path)}]"
 
-        # CAMPOS VISUAIS
+        # model selection
+        front = normalize_text_for_html(front_raw, cloze=(ctype=="cloze"))
+        back  = normalize_text_for_html(back_raw)
+        tags = sanitize_tags(c.get("tags", []))
+        if default_tag: tags = sanitize_tags(tags + [default_tag])
+
         if ctype == "cloze":
-            text = c.get("front","")
-            back_extra = c.get("back","") or ""
-            note = genanki.Note(
-                model=MODEL_CLOZE,
-                fields=[text, back_extra, hint, examples_html, audio_field, extra],
-                tags=sanitize_tags(c.get("tags", []))
-            )
+            note = genanki.Note(model=MODEL_CLOZE,
+                                fields=[front, back, hint, examples_html, audio_field, extra],
+                                tags=tags)
+        elif ctype == "reverse":
+            note = genanki.Note(model=MODEL_REVERSE,
+                                fields=[front, back, hint, examples_html, audio_field, extra],
+                                tags=tags)
         else:
-            front = normalize_text_for_html(front_raw)
-            back  = normalize_text_for_html(back_raw)
-            note = genanki.Note(
-                model=MODEL_BASIC,
-                fields=[front, back, hint, examples_html, audio_field, extra],
-                tags=sanitize_tags(c.get("tags", []))
-            )
+            note = genanki.Note(model=MODEL_BASIC,
+                                fields=[front, back, hint, examples_html, audio_field, extra],
+                                tags=tags)
         deck.add_note(note)
 
     for i, c in enumerate(cards):
@@ -731,20 +880,134 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "exemplos", ex
     return apkg_bytes
 
 # =========================
+# PREVIEW & STATS
+# =========================
+def build_sample(payload: Dict[str, Any], sample_n: int = 8) -> Dict[str, Any]:
+    _payload = dict(payload)
+    _payload["limite_cartoes"] = int(sample_n)
+    data = gerar_baralho(_payload)
+    cards = dedupe_cards(data.get("cards", []))
+    kws = payload.get("domain_keywords", [])
+    minima_pct = payload.get("minima_overrides") or goal_mix_minima(payload.get("goal","General learning"))
+    seed_ids = set()  # no seeds in quick preview
+    filtered, _need = enforce_mix_and_anchoring(
+        cards, kws, payload.get("require_anchor", True),
+        payload.get("max_qa_pct", 0.5), minima_pct, seed_ids
+    )
+    data["cards"] = filtered[:sample_n]
+    data["deck"]["card_count_planned"] = len(data["cards"])
+    return data
+
+def render_card_preview(c: Dict[str, Any], lang: str) -> str:
+    typ = (c.get("type") or "basic").title()
+    front_raw, back_raw = orient_q_a(c, lang)
+    front = normalize_text_for_html(front_raw, cloze=(typ.lower()=="cloze"))
+    back  = normalize_text_for_html(back_raw)
+    hint = html_escape(c.get("hint") or "")
+    src = c.get("source_ref") or {}
+    src_str = " • ".join([x for x in [src.get("file"), src.get("page_or_time")] if x])
+    exs = examples_to_html(c.get("examples"))
+    parts = [
+        f"<div style='border:1px solid #e3e3e3;border-radius:10px;padding:10px;margin-bottom:10px;'>",
+        f"<div style='font-weight:600;opacity:.8;margin-bottom:6px;'>{typ}</div>",
+        f"<div><b>Q:</b> {front}</div>",
+        f"<div style='margin-top:6px;'><b>A:</b> {back}</div>",
+    ]
+    if hint:
+        parts.append(f"<div style='margin-top:6px;color:#666;'><b>Hint:</b> {hint}</div>")
+    if exs:
+        parts.append(f"<div style='margin-top:6px;'><b>Examples:</b> {exs}</div>")
+    if src_str:
+        parts.append(f"<div style='margin-top:6px;color:#444;'><b>Source:</b> {html_escape(src_str)}</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+def deck_stats(cards):
+    kinds = [card_kind(c) for c in cards]
+    total = len(cards) or 1
+    return {
+      "total": total,
+      "qa_pct": 100*sum(1 for k in kinds if k=="qa")/total,
+      "cloze_pct": 100*sum(1 for k in kinds if k=="cloze")/total,
+      "scenario_pct": 100*sum(1 for k in kinds if k=="scenario")/total,
+      "procedure_pct": 100*sum(1 for k in kinds if k=="procedure")/total,
+      "avg_back_len": sum(len(strip_html_to_plain(c.get("back",""))) for c in cards)/total
+    }
+
+# Editable preview helpers (CSV/JSON I/O)
+def cards_to_df(cards):
+    if not pd: return None
+    rows = []
+    for c in cards:
+        rows.append({
+          "keep": True,
+          "type": c.get("type","basic"),
+          "front": strip_html_to_plain(c.get("front") or c.get("Text","")),
+          "back":  strip_html_to_plain(c.get("back") or c.get("BackExtra","")),
+          "hint":  c.get("hint",""),
+          "tags":  ",".join(sanitize_tags(c.get("tags",[])))
+        })
+    return pd.DataFrame(rows)
+
+def df_to_cards(df, lang):
+    out = []
+    for _,r in df.iterrows():
+        if not r.get("keep",False): continue
+        tags = sanitize_tags([t.strip() for t in str(r.get("tags","")).split(",") if t.strip()])
+        cid = f"preseed-{hashlib.md5((str(r['type'])+str(r['front'])).encode()).hexdigest()[:8]}"
+        out.append({
+          "id": cid,
+          "type": r["type"],
+          "front": normalize_text_for_html(r["front"], cloze=(r["type"]=="cloze")),
+          "back":  normalize_text_for_html(r["back"]),
+          "hint":  html_escape(r.get("hint","")),
+          "examples": [],
+          "tags": tags,
+          "source_ref": {}, "rationale": ""
+        })
+    return out
+
+def csv_to_seed_cards(csv_bytes: bytes, lang: str) -> List[Dict[str,Any]]:
+    if not pd: return []
+    try:
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+    except Exception:
+        return []
+    req = {"type","front","back"}
+    if not req.issubset(set(df.columns)): return []
+    # add keep default true if missing
+    if "keep" not in df.columns: df["keep"] = True
+    if "tags" not in df.columns: df["tags"] = ""
+    if "hint" not in df.columns: df["hint"] = ""
+    return df_to_cards(df, lang)
+
+# =========================
 # UI
 # =========================
-st.title("🧠 Anki-Generator")
-st.caption("Cartões com active recall + conhecimento atômico. Variedade de formatos e ancoragem em documentos.")
+st.title("🧠 Anki-Generator — Pro")
+st.caption("Active recall + conhecimento atômico • RAG opcional • Pré-visualização editável • Export/Import CSV • TTS controlado")
 
-col1, col2 = st.columns([1,2])
-with col1:
-    idioma = st.selectbox("Idioma", ["fr-FR","pt-BR","en-US","es-ES","zh-CN"], index=0)
+# Session state
+for key, default in [
+    ("sample_data", None),
+    ("user_feedback", ""),
+    ("sample_n", 8),
+    ("approved_cards", []),
+    ("seed_random", 0),
+]:
+    if key not in st.session_state: st.session_state[key] = default
+
+# Basic controls
+left, right = st.columns([1,2])
+with left:
+    deck_title = st.text_input("Deck title", "Anki-Generator Deck")
+    default_tag = st.text_input("Default tag (optional)", "")
+    idioma = st.selectbox("Idioma (deck)", ["fr-FR","pt-BR","en-US","es-ES","zh-CN"], index=0)
     nivel  = st.text_input("Nível/CEFR (opcional)", "B1")
-    limite = st.slider("Qtde de cartões", 4, 120, 24, 1)
+    limite = st.slider("Qtde de cartões (deck final)", 4, 200, 40, 1)
     tipos  = st.multiselect("Tipos de cartão", ["basic","reverse","cloze"], default=["basic","reverse","cloze"])
     tts    = st.radio("TTS (gTTS)", ["nenhuma","respostas","exemplos","todas"], index=2)
-    strict = st.checkbox("Exigir exatamente N (completar se vierem menos)", value=True)
-    # Objetivos
+
     goal = st.selectbox(
         "Goal / Focus",
         [
@@ -758,72 +1021,251 @@ with col1:
         ],
         index=3
     )
-    max_qa_pct = st.slider("Max % of Q&A cards", 20, 80, 45, 5)
-    require_anchor = st.checkbox("Require source anchoring (from uploaded docs)", value=True)
-    extra_choice = st.selectbox(
-        "Seção extra do cartão",
-        ["Dica de uso","Erro comum","Mnemônico","Auto-checagem","Fonte","Nenhum"],
-        index=0
-    )
-    _kind_map = {
-        "Dica de uso":"usage_tip", "Erro comum":"common_pitfall", "Mnemônico":"mnemonic",
-        "Auto-checagem":"self_check", "Fonte":"source", "Nenhum":"none"
-    }
-    extra_kind = _kind_map[extra_choice]
 
-with col2:
+    seed_val = st.number_input("Random seed (optional)", min_value=0, value=0, step=1)
+    if seed_val:
+        random.seed(seed_val)
+        st.session_state["seed_random"] = seed_val
+
+with right:
     topico = st.text_area(
-        "Tópico (ou diretrizes de geração)",
+        "Tópico / Diretrizes de geração",
         "Tempos do passado em francês: passé composé, imparfait, plus-que-parfait, passé simple – usos, diferenças e exemplos",
-        height=140
+        height=120
     )
+    url_text = st.text_area("URLs (opcional, um por linha)", "", height=80)
     files  = st.file_uploader(
         "Arquivos (PDF/DOCX/TXT/MD – opcional; para políticas, suba os documentos oficiais)",
         type=["pdf","docx","txt","md","markdown"], accept_multiple_files=True
     )
 
-btn = st.button("Gerar baralho (.apkg)", type="primary", use_container_width=True)
+# Advanced options
+with st.expander("⚙️ Advanced"):
+    strict = st.checkbox("Exigir exatamente N (Strict mode com top-up)", value=True)
+    require_anchor = st.checkbox("Require source anchoring (from uploaded docs/URLs)", value=True)
+    max_qa_pct = st.slider("Max % of Q&A cards", 10, 90, 45, 5)
 
-if btn:
+    st.markdown("**Per-goal minima overrides (% of deck)**")
+    use_override = st.checkbox("Override goal minima", value=False)
+    base_minima = goal_mix_minima(goal)
+    cloze_min = st.slider("Min Cloze %", 0, 80, int(base_minima["cloze"]*100), 5, disabled=not use_override)
+    scenario_min = st.slider("Min Scenario %", 0, 80, int(base_minima["scenario"]*100), 5, disabled=not use_override)
+    procedure_min = st.slider("Min Procedure %", 0, 80, int(base_minima["procedure"]*100), 5, disabled=not use_override)
+
+    st.markdown("**Strict parameters**")
+    max_rounds = st.slider("Max strict rounds", 1, 8, STRICT_MAX_ROUNDS_DEFAULT, 1)
+    batch_size = st.slider("Per-round batch size", 10, 50, STRICT_BATCH_DEFAULT, 5)
+
+    st.markdown("**TTS preferences (large decks)**")
+    keep_tts_lang_big = st.checkbox("Keep TTS for big decks in language modes", value=True)
+    audio_coverage = st.selectbox("TTS coverage", ["Sampled (up to 24 cards)", "All cards (slower)"], index=0)
+
+    st.markdown("**RAG context**")
+    use_rag = st.checkbox("Use smart context (RAG) with TF-IDF selection", value=True)
+    rag_topk = st.slider("RAG sections (top-k)", 3, 12, 6, 1)
+
+# Preview controls
+st.session_state.sample_n = st.slider("Preview: number of sample cards", 4, 20, st.session_state.sample_n, 1)
+with st.expander("Optional: refinement instructions for the model (used for sample and final)"):
+    st.session_state.user_feedback = st.text_area(
+        "Refine style/content (e.g., “more cloze on thresholds”, “focus on procedure exceptions”, “B2 grammar patterns, less Q&A, include IPA”)",
+        st.session_state.user_feedback,
+        height=110
+    )
+
+# CSV seed import/export
+seed_upload = st.file_uploader("Seed cards from CSV (columns: type,front,back[,hint,tags,keep])", type=["csv"])
+
+btn_cols = st.columns(3)
+preview_btn = btn_cols[0].button("🔎 Generate sample preview")
+regenerate_btn = btn_cols[1].button("🔁 Regenerate sample with feedback")
+build_btn = btn_cols[2].button("🏗️ Build full deck (.apkg)", type="primary")
+
+# ------- PROCESSAMENTO --------
+def compute_effective_tts(tts_choice: str, n_cards: int, goal_str: str, keep_big_lang: bool) -> str:
+    effective = tts_choice
+    is_language_goal = goal_str.lower().startswith("language")
+    if tts_choice != "nenhuma" and n_cards > 40 and not (is_language_goal and keep_big_lang):
+        effective = "nenhuma"
+        st.info("TTS disabled automatically for large decks (>40). Enable the checkbox to keep TTS in language modes.")
+    elif tts_choice != "nenhuma" and n_cards > 40 and (is_language_goal and keep_big_lang):
+        st.warning("TTS kept ON for a large language deck. Consider 'Sampled' coverage to keep it fast.")
+    return effective
+
+def prepare_payload(effective_tts: str, digest: str, domain_kws: List[str], minima_overrides: Optional[Dict[str,float]]=None, seed_cards=None) -> Dict[str, Any]:
+    return {
+        "deck_title": deck_title,
+        "idioma_alvo": idioma,
+        "nivel_proficiencia": nivel,
+        "topico": topico.strip(),
+        "limite_cartoes": limite,
+        "tipos_permitidos": tipos,
+        "politica_voz": f"tts={effective_tts}",
+        "materiais_digest": digest,
+        "extra_policy": extra_kind,
+        "goal": goal,
+        "max_qa_pct": max_qa_pct/100.0,
+        "require_anchor": require_anchor,
+        "domain_keywords": domain_kws,
+        "user_feedback": st.session_state.user_feedback.strip(),
+        "minima_overrides": minima_overrides,
+        "seed_cards": seed_cards or []
+    }
+
+# map extra selection
+_kind_map = {
+    "Dica de uso":"usage_tip", "Erro comum":"common_pitfall", "Mnemônico":"mnemonic",
+    "Auto-checagem":"self_check", "Fonte":"source", "Nenhum":"none"
+}
+extra_choice = st.selectbox("Seção extra do cartão", list(_kind_map.keys()), index=0)
+extra_kind = _kind_map[extra_choice]
+
+# Material ingest
+materials = ingest_files(files) if files else []
+urls = [u for u in (url_text.splitlines() if url_text else []) if u.strip()]
+if urls:
+    if not requests:
+        st.warning("Requests/BS4 not available. Install optional dependencies to use URLs.")
+    else:
+        with st.spinner("Fetching URLs…"):
+            materials += ingest_urls(urls)
+
+# RAG or simple digest
+digest = ""
+chosen_sections_meta = []
+if materials:
+    if use_rag:
+        digest, chosen_sections_meta = rag_digest(materials, topico, st.session_state.user_feedback, top_k=rag_topk)
+    else:
+        digest = compress_materials_simple(materials)
+# domain keywords
+domain_kws = extract_domain_keywords(digest) if digest else extract_domain_keywords(topico)
+
+# TTS effective
+effective_tts = compute_effective_tts(tts, limite, goal, keep_tts_lang_big)
+coverage_mode = "all" if audio_coverage.startswith("All") else "sampled"
+
+# Seed from CSV
+seed_from_csv = []
+if seed_upload is not None:
+    if not pd:
+        st.error("Pandas não disponível para ler CSV.")
+    else:
+        seed_from_csv = csv_to_seed_cards(seed_upload.read(), idioma)
+        if seed_from_csv:
+            st.success(f"CSV seed loaded: {len(seed_from_csv)} cards")
+
+# Preview generation
+if preview_btn or regenerate_btn:
+    if not topico.strip():
+        st.error("Preencha o campo Tópico.")
+        st.stop()
+    with st.spinner("Generating sample…"):
+        payload = prepare_payload("nenhuma", digest, domain_kws, None, seed_cards=[])
+        st.session_state.sample_data = build_sample(payload, sample_n=st.session_state.sample_n)
+
+# Show preview
+if st.session_state.sample_data:
+    st.subheader("Preview")
+    deck_meta = st.session_state.sample_data.get("deck", {})
+    lang = deck_meta.get("language","en")
+    cards = st.session_state.sample_data.get("cards", [])[: st.session_state.sample_n]
+
+    if not cards:
+        st.warning("No sample cards generated under current constraints. Try unchecking ‘Require anchoring’, increase preview size, or add more materials.")
+    else:
+        stats = deck_stats(cards)
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Cards", stats["total"])
+        c2.metric("Q&A %", f"{stats['qa_pct']:.0f}%")
+        c3.metric("Cloze %", f"{stats['cloze_pct']:.0f}%")
+        c4.metric("Scenario %", f"{stats['scenario_pct']:.0f}%")
+        c5.metric("Avg answer chars", f"{stats['avg_back_len']:.0f}")
+        if stats["qa_pct"] > max_qa_pct:
+            st.warning("Q&A exceeds the configured maximum. Add feedback or lower max %.")
+        if stats["avg_back_len"] > 360:
+            st.info("Answers look long. Ask for more cloze/procedure cards in the feedback.")
+
+        cols = st.columns(2)
+        for i, c in enumerate(cards):
+            html = render_card_preview(c, lang)
+            (cols[i % 2]).markdown(html, unsafe_allow_html=True)
+
+        # Editable table + seed approval
+        if pd:
+            df = cards_to_df(cards)
+            edited = st.data_editor(df, use_container_width=True, num_rows="fixed", key="preview_editor")
+            st.session_state["approved_cards"] = df_to_cards(edited, lang)
+
+        exp = st.expander("🔍 Sample JSON / Export CSV")
+        with exp:
+            st.code(json.dumps(st.session_state.sample_data, ensure_ascii=False, indent=2), language="json")
+            # CSV export
+            if pd:
+                csv_df = cards_to_df(cards)
+                if csv_df is not None:
+                    st.download_button("⬇️ Download sample CSV", data=csv_df.to_csv(index=False).encode("utf-8"),
+                                       file_name="anki_sample.csv", mime="text/csv")
+
+# Build full deck
+if build_btn:
     if not topico.strip():
         st.error("Preencha o campo Tópico.")
         st.stop()
 
-    with st.spinner("Gerando cartões…"):
-        materials = ingest_files(files) if files else []
-        digest = compress_materials(materials) if materials else ""
+    # minima overrides
+    minima_overrides = None
+    if use_override:
+        minima_overrides = {"cloze":cloze_min/100.0, "scenario":scenario_min/100.0, "procedure":procedure_min/100.0}
 
-        # Desativa TTS para decks muito grandes (rápido)
-        effective_tts = tts
-        if tts != "nenhuma" and limite > 40:
-            effective_tts = "nenhuma"
-            st.info("TTS desativado automaticamente para decks grandes (>40) para acelerar. Gere um deck menor se quiser áudio.")
+    # combine seeds: approved preview + CSV
+    seed_cards = (st.session_state.get("approved_cards", []) or []) + (seed_from_csv or [])
 
-        # keywords do domínio a partir dos docs (ou do tópico)
-        domain_kws = extract_domain_keywords(digest) if digest else extract_domain_keywords(topico)
-
-        payload = {
-            "idioma_alvo": idioma,
-            "nivel_proficiencia": nivel,
-            "topico": topico.strip(),
-            "limite_cartoes": limite,
-            "tipos_permitidos": tipos,
-            "politica_voz": f"tts={effective_tts}",
-            "materiais_digest": digest,
-            "extra_policy": extra_kind,
-            "goal": goal,
-            "max_qa_pct": max_qa_pct/100.0,
-            "require_anchor": require_anchor,
-            "domain_keywords": domain_kws
-        }
-
+    with st.spinner("Building full deck…"):
+        payload = prepare_payload(effective_tts, digest, domain_kws, minima_overrides, seed_cards=seed_cards)
         prog = st.progress(0.0)
-        data = gerar_baralho_estrito(payload, progress=prog) if strict else gerar_baralho(payload)
-        apkg_bytes = build_apkg_bytes(data, tts_policy=effective_tts, extra_kind=extra_kind)
-        file_name = f"Anki-Generator_{int(time.time())}.apkg"
+        data = gerar_baralho_estrito(payload, progress=prog, max_rounds=max_rounds, batch_size=batch_size) if strict else gerar_baralho(payload)
+
+        # If anchoring was required but missing, try light auto-anchoring by overlap against chosen sections
+        if require_anchor and chosen_sections_meta and data.get("cards"):
+            for c in data["cards"]:
+                src = c.get("source_ref") or {}
+                if src.get("file") or src.get("page_or_time"): continue
+                blob = (c.get("front","") + " " + c.get("back","")).lower()
+                best = None; best_score = 0
+                for s in chosen_sections_meta:
+                    score = sum(1 for t in set(re.findall(r"\w+", blob)) if t in s["content"].lower())
+                    if score > best_score:
+                        best = s; best_score = score
+                if best and best_score > 5:
+                    c["source_ref"] = {"file": best["file"], "page_or_time": best["title"], "span": None}
+
+        apkg_bytes = build_apkg_bytes(
+            data,
+            tts_policy=effective_tts,
+            extra_kind=extra_kind,
+            tts_coverage=coverage_mode,
+            default_tag=default_tag
+        )
+        file_name = f"{slugify(deck_title)}_{int(time.time())}.apkg"
 
         st.success(f"Baralho gerado com {len(data.get('cards', []))} cartões!")
         st.download_button("⬇️ Baixar .apkg", data=apkg_bytes, file_name=file_name, mime="application/octet-stream")
-        with st.expander("🔍 Ver JSON gerado (debug)"):
-            st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
 
+        # Export final JSON & CSV
+        with st.expander("📦 Export deck JSON / CSV"):
+            st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
+            if pd:
+                # Convert to CSV for export
+                rows = []
+                for c in data.get("cards", []):
+                    rows.append({
+                        "type": c.get("type","basic"),
+                        "front": strip_html_to_plain(c.get("front") or c.get("Text","")),
+                        "back": strip_html_to_plain(c.get("back") or c.get("BackExtra","")),
+                        "hint": c.get("hint",""),
+                        "tags": ",".join(sanitize_tags(c.get("tags",[])))
+                    })
+                df_final = pd.DataFrame(rows)
+                st.download_button("⬇️ Download final CSV", data=df_final.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"{slugify(deck_title)}.csv", mime="text/csv")
