@@ -1026,4 +1026,3 @@ with st.sidebar:
         if colM2.button("Build (manual)"):
             st.session_state.pending_build = True
             st.experimental_rerun()
-```
