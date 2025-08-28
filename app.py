@@ -74,8 +74,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 # -------------------------
 # Constants
 # -------------------------
-TEXT_MODEL = "gpt-4o"
-MAX_AUDIO_FILES = 150
+TEXT_MODEL = "gpt-4o-mini"
+MAX_AUDIO_FILES = 24
 AUDIO_CHAR_LIMIT = 400
 
 # -------------------------
@@ -193,8 +193,8 @@ def ingest_urls(urls: List[str]) -> List]:
             mats.append({"file": name, "content": txt})
     return mats
 
-def ingest_youtube_transcript(url: str) -> List]:
-    if not YOUTUBE_DEPS_OK: return
+def ingest_youtube_transcript(url: str) -> Optional]]:
+    if not YOUTUBE_DEPS_OK: return None
     try:
         yt = YouTube(url)
         video_id = yt.video_id
@@ -206,7 +206,7 @@ def ingest_youtube_transcript(url: str) -> List]:
         return [{"file": f"youtube_{video_id}", "content": f"# {title}\n{full_transcript}"}]
     except Exception as e:
         st.error(f"Error ingesting YouTube video: {e}")
-        return
+        return None
 
 def split_sections(text: str, file_name: str) -> List]:
     sections =
@@ -447,7 +447,7 @@ def strip_html_to_plain(s: str) -> str:
     if not s: return ""
     s2 = re.sub(r"<[^>]+>", " ", s)
     s2 = (s2.replace("&nbsp;"," ").replace("&amp;","&")
-            .replace("&lt;","<").replace("&gt;",">"))
+           .replace("&lt;","<").replace("&gt;",">"))
     s2 = re.sub(r"\s+", " ", s2).strip()
     return s2
 def examples_to_html(examples: Optional]]) -> str:
@@ -572,7 +572,6 @@ def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str
     audio_script = (card.get("audio_script") or "").strip()
     ex = ""
     if isinstance(card.get("examples"), list) and card["examples"]:
-        # Corrected: Access the first item in the examples list
         ex = (card["examples"].get("text") or "").strip()
     p = policy.lower()
     candidates =
