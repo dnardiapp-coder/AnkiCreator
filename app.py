@@ -1,4 +1,4 @@
-# app.py — Chat-First Anki Deck Creator (fixed & production-ready)
+# app.py — Chat-First Anki Deck Creator (UX-polished & robust)
 
 import os, io, json, time, tempfile, hashlib, re, random
 from typing import List, Dict, Any, Optional, Tuple
@@ -13,7 +13,7 @@ from pypdf import PdfReader
 import docx as docxlib
 from unidecode import unidecode
 
-# ---- Optional deps ----
+# ---- Optional dependencies (gracefully degraded) ----
 try:
     from pytube import YouTube
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -60,6 +60,11 @@ st.markdown("""
 .kpi .val { font-weight:700; font-size:1.1rem; }
 .card-prev { border:1px solid #e9e9ef; border-radius:12px; padding:10px; margin-bottom:10px; }
 hr { border:none; border-top:1px solid #eee; margin:1rem 0; }
+.step { padding:.5rem .75rem; border-radius:8px; border:1px solid #eaeaf2; background:#fafbff; margin-bottom:.5rem;}
+.step .title { font-weight:600; }
+.badge { display:inline-block; padding:.15rem .5rem; border-radius:999px; font-size:.75rem; background:#eef2ff; border:1px solid #e0e7ff; color:#3730a3; }
+.help { color:#555; font-size:.92rem; }
+.source-chip { display:inline-block; margin:2px 6px 2px 0; padding:.2rem .5rem; background:#f3f4f6; border:1px solid #e5e7eb; border-radius:999px; font-size:.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -77,8 +82,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
 # -------------------------
 # Constants
 # -------------------------
-TEXT_MODEL = "gpt-4o"
-MAX_AUDIO_FILES = 80
+TEXT_MODEL = "gpt-4o-mini"
+MAX_AUDIO_FILES = 24
 AUDIO_CHAR_LIMIT = 400
 
 
@@ -128,7 +133,45 @@ Os percentuais devem somar aproximadamente 100 (ignore scenario/procedure se nã
 
 
 # -------------------------
-# Data ingestion
+# Session state
+# -------------------------
+def ss_init(k, v):
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+for k, v in [
+    ("messages", []),
+    ("topic", ""),
+    ("deck_title", ""),
+    ("goal", "Language: Vocabulary"),
+    ("idioma", "fr-FR"),
+    ("nivel", "B1"),
+    ("tipos", ["basic", "reverse", "cloze"]),
+    ("target_n", 36),
+    ("max_qa_pct", 0.45),
+    ("require_anchor", True),
+    ("default_tag", ""),
+    ("materials", []),  # [{"file": ..., "content": ...}]
+    ("urls_text", ""),
+    ("youtube_urls_text", ""),
+    ("digest", ""),
+    ("chosen_sections_meta", []),
+    ("domain_kws", []),
+    ("assessment", None),
+    ("assessment_ok", False),
+    ("preview_cards", []),
+    ("approved_cards", []),
+    ("tts_mode", "examples"),
+    ("tts_cov", "sampled"),
+    ("mode", "Chat"),  # or "Form"
+    ("pending_preview", False),
+    ("pending_build", False),
+]:
+    ss_init(k, v)
+
+
+# -------------------------
+# Ingestion utilities
 # -------------------------
 def extract_pdf(file_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -141,17 +184,14 @@ def extract_pdf(file_bytes: bytes) -> str:
                 out.append(f"[p.{i}]\n{t}")
         return "\n\n".join(out)
 
-
 def extract_docx(file_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         tmp.write(file_bytes); tmp.flush()
         doc = docxlib.Document(tmp.name)
         return "\n".join(p.text for p in doc.paragraphs)
 
-
 def extract_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
-
 
 def ingest_files(uploaded_files) -> List[Dict[str, str]]:
     mats: List[Dict[str, str]] = []
@@ -169,7 +209,6 @@ def ingest_files(uploaded_files) -> List[Dict[str, str]]:
             continue
         mats.append({"file": name, "content": text})
     return mats
-
 
 def fetch_url_text(url: str, timeout: int = 25) -> str:
     if not requests:
@@ -195,7 +234,6 @@ def fetch_url_text(url: str, timeout: int = 25) -> str:
     except Exception:
         return ""
 
-
 def ingest_urls(urls: List[str]) -> List[Dict[str, str]]:
     mats: List[Dict[str, str]] = []
     for u in urls:
@@ -208,7 +246,6 @@ def ingest_urls(urls: List[str]) -> List[Dict[str, str]]:
             mats.append({"file": name, "content": txt})
     return mats
 
-
 def ingest_youtube_transcript(url: str) -> Optional[List[Dict[str, str]]]:
     if not YOUTUBE_DEPS_OK:
         return None
@@ -216,7 +253,6 @@ def ingest_youtube_transcript(url: str) -> Optional[List[Dict[str, str]]]:
         yt = YouTube(url)
         video_id = yt.video_id
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        # Try English, Portuguese, French in order
         for lang in ['en', 'pt', 'fr']:
             try:
                 transcript = transcript_list.find_transcript([lang])
@@ -252,7 +288,6 @@ def split_sections(text: str, file_name: str) -> List[Dict[str, str]]:
         sections.append({"file": file_name, "title": title, "content": pt[:4000]})
     return sections or [{"file": file_name, "title": f"{file_name} — full", "content": text[:4000]}]
 
-
 def simple_keyword_rank(query: str, sections: List[Dict[str, str]], top_k: int = 6) -> List[int]:
     q_toks = set(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,}", query.lower()))
     scores: List[Tuple[int, int]] = []
@@ -262,7 +297,6 @@ def simple_keyword_rank(query: str, sections: List[Dict[str, str]], top_k: int =
         scores.append((score, i))
     scores.sort(reverse=True)
     return [i for _, i in scores[:top_k]]
-
 
 def tfidf_rank(query: str, sections: List[Dict[str, str]], top_k: int = 6) -> List[int]:
     docs = [s["content"] for s in sections]
@@ -275,7 +309,6 @@ def tfidf_rank(query: str, sections: List[Dict[str, str]], top_k: int = 6) -> Li
         return top.tolist()
     except Exception:
         return simple_keyword_rank(query, sections, top_k)
-
 
 def rag_digest(materials: List[Dict[str, str]], topic: str, user_feedback: str,
                top_k: int = 6, max_chars: int = 12000) -> Tuple[str, List[Dict[str, str]]]:
@@ -315,7 +348,6 @@ def chat_json(messages, model=TEXT_MODEL, temperature=0, max_tries=4):
             time.sleep(min(8, 2 ** i + random.random()))
     raise last_err
 
-
 def _safe_json(content: str) -> dict:
     try:
         return json.loads(content)
@@ -323,6 +355,227 @@ def _safe_json(content: str) -> dict:
         return {}
 
 
+# -------------------------
+# Validation & variety
+# -------------------------
+REQUIRED_CARD_FIELDS = {"type", "front", "back"}
+
+def strip_html_to_plain(s: str) -> str:
+    if not s:
+        return ""
+    s2 = re.sub(r"<[^>]+>", " ", s)
+    s2 = (s2.replace("&nbsp;", " ").replace("&amp;", "&")
+           .replace("&lt;", "<").replace("&gt;", ">"))
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
+
+def valid_card(c: dict) -> bool:
+    if not isinstance(c, dict):
+        return False
+    # accept normalized ('front'/'back') or raw cloze 'Text'
+    typ = (c.get("type") or "").lower()
+    if typ == "cloze":
+        cloze_src = c.get("front", "") or c.get("Text", "")
+        if "{{c" not in cloze_src:
+            return False
+        # ensure 'back' exists (may be placeholder); keep short answer explanation
+        if len(strip_html_to_plain(c.get("back", ""))) > 420:
+            return False
+        return True
+    # basic/reverse
+    if not all(k in c and (c[k] is not None and len(str(c[k]).strip()) > 0) for k in REQUIRED_CARD_FIELDS):
+        return False
+    if len(strip_html_to_plain(c.get("back", ""))) > 420:
+        return False
+    return True
+
+def dedupe_cards(cards: list) -> list:
+    def sig(c):
+        t = (c.get("type") or "").lower().strip()
+        f = (c.get("front") or c.get("Text") or "").strip().lower()
+        b = (c.get("back") or c.get("BackExtra") or "").strip().lower()
+        return hashlib.md5(f"{t}|{f[:160]}|{b[:160]}".encode()).hexdigest()
+    seen, out = set(), []
+    for c in (cards or []):
+        if not isinstance(c, dict):
+            continue
+        s = sig(c)
+        if s in seen:
+            continue
+        seen.add(s); out.append(c)
+    return out
+
+def contains_domain_keyword(card: dict, kws: List[str]) -> bool:
+    if not kws:
+        return True
+    blob = f"{card.get('front','')} | {card.get('back','')}".lower()
+    return any(k in blob for k in kws[:40])
+
+def kind_of(c: dict) -> str:
+    t = (c.get("type") or "").lower()
+    if t == "cloze":
+        return "cloze"
+    f = (c.get("front") or "").lower()
+    if "?" in f:
+        return "qa"
+    if any(k in f for k in ["scenario:", "cenário:", "case:", "caso:"]):
+        return "scenario"
+    if any(k in f for k in ["procedure", "procedimento", "step", "passo", "ordem"]):
+        return "procedure"
+    return "basic"
+
+def anchored_to_source(card: dict) -> bool:
+    src = card.get("source_ref") or {}
+    return bool(src.get("file") or src.get("page_or_time"))
+
+def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float,
+                    require_anchor_effective: bool, seed_ids: set) -> List[dict]:
+    filtered: List[dict] = []
+    for c in cards:
+        if require_anchor_effective and not anchored_to_source(c) and c.get("id") not in seed_ids:
+            continue
+        if not contains_domain_keyword(c, kws) and c.get("id") not in seed_ids:
+            continue
+        filtered.append(c)
+    if not filtered:
+        # fallback to preserve UX (avoid empty preview)
+        return cards
+    total = max(1, len(filtered))
+    qa_idx = [i for i, c in enumerate(filtered) if kind_of(c) == "qa" and c.get("id") not in seed_ids]
+    max_qa = int(max_qa_frac * total)
+    if len(qa_idx) > max_qa:
+        drop = set(qa_idx[max_qa:])
+        filtered = [c for i, c in enumerate(filtered) if i not in drop]
+    return filtered
+
+
+# -------------------------
+# Text & audio helpers
+# -------------------------
+def slugify(text: str, maxlen: int = 64) -> str:
+    t = unidecode(text or "").lower()
+    t = re.sub(r"[^\w\s-]", "", t)
+    t = re.sub(r"[\s-]+", "-", t).strip("-")
+    return t[:maxlen] or f"slug-{int(time.time())}"
+
+def html_escape(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def normalize_text_for_html(s: str, cloze: bool = False) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = re.sub(r"^```+|\n```+$", "", s)
+    if cloze:
+        s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    else:
+        s = html_escape(s)
+    s = s.replace("\n", "<br>")
+    return s
+
+def examples_to_html(examples: Optional[List[Dict[str, str]]]) -> str:
+    if not examples:
+        return ""
+    items: List[str] = []
+    for ex in examples:
+        if not isinstance(ex, dict):
+            continue
+        line = html_escape(ex.get("text", ""))
+        tr = ex.get("translation")
+        nt = ex.get("notes")
+        if tr:
+            line += f' <span class="tr">({html_escape(tr)})</span>'
+        if nt:
+            line += f' <span class="nt">[{html_escape(nt)}]</span>'
+        items.append(f"<li>{line}</li>")
+    return "<ul class='examples-list'>" + "".join(items) + "</ul>"
+
+def map_lang_for_gtts(language_code: str) -> str:
+    langs = tts_langs()
+    if not language_code:
+        return "en"
+    lc = language_code.lower()
+    prefs = {
+        "fr": ["fr"], "pt": ["pt", "pt-br"], "en": ["en", "en-us", "en-gb"],
+        "es": ["es"], "de": ["de"], "it": ["it"],
+        "zh": ["zh", "zh-cn", "cmn-cn", "zh-tw"], "ja": ["ja"],
+    }
+    for k, choices in prefs.items():
+        if lc.startswith(k):
+            for code in choices:
+                if code in langs:
+                    return code
+    for cand in (lc, lc.replace("_", "-")):
+        if cand in langs:
+            return cand
+    return "en"
+
+def synth_audio(text: str, lang_code: str) -> Optional[bytes]:
+    t = (text or "").strip()
+    if not t or len(t) > AUDIO_CHAR_LIMIT:
+        return None
+    try:
+        fp = io.BytesIO()
+        gTTS(text=t, lang=map_lang_for_gtts(lang_code)).write_to_fp(fp)
+        return fp.getvalue()
+    except Exception:
+        return None
+
+def _clean_tag(tag) -> str:
+    t = str(tag or "").strip().lower()
+    t = re.sub(r"\s+", "-", t)
+    t = re.sub(r"[^a-z0-9_\-:]", "", t)
+    return t[:40]
+
+def sanitize_tags(tags) -> list:
+    if not isinstance(tags, list):
+        return []
+    out, seen = [], set()
+    for t in tags:
+        ct = _clean_tag(t)
+        if ct and ct not in seen:
+            out.append(ct); seen.add(ct)
+        if len(out) >= 12:
+            break
+    return out
+
+QUESTION_WORDS = {
+    "fr": ["qui","que","quoi","quel","quelle","quels","quelles","où","quand","comment","pourquoi","combien"],
+    "pt": ["o que","qual","quais","quando","onde","como","por que","por quê","quem","quanto","quantos","quantas"],
+    "en": ["what","which","when","where","how","why","who","whom","whose"],
+}
+
+def _lang_prefix(lang: str) -> str:
+    l = (lang or "en").lower()
+    for k in ["fr","pt","en","es","de","it"]:
+        if l.startswith(k): return k
+    return "en"
+
+def looks_like_question(text: str, lang: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if "?" in t:
+        return True
+    lp = _lang_prefix(lang)
+    w = re.sub(r'^[\-\•\–\s]+', '', t.lower())
+    return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp, []))
+
+def orient_q_a(card: Dict[str, Any], lang: str) -> Tuple[str, str]:
+    f = (card.get("front") or card.get("Text") or "").strip()
+    b = (card.get("back") or card.get("BackExtra") or "").strip()
+    fq, bq = looks_like_question(f, lang), looks_like_question(b, lang)
+    if fq and not bq: return f, b
+    if bq and not fq: return b, f
+    if len(f) > len(b): return b, f
+    return f, b
+
+
+# -------------------------
+# LLM pipelines
+# -------------------------
 def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         messages = [
@@ -340,31 +593,25 @@ def gerar_baralho(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cards, list):
         cards = []
 
-    # --- Normalize cards BEFORE validation ---
-normalized = []
-for c in cards:
-    if not isinstance(c, dict):
-        continue
-    typ = (c.get("type") or "basic").lower()
+    # --- Normalize BEFORE validation (handle cloze Text/BackExtra) ---
+    normalized = []
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        typ = (c.get("type") or "basic").lower()
+        if typ == "cloze":
+            if not c.get("front") and c.get("Text"):
+                c["front"] = str(c.get("Text", ""))
+            if not c.get("back"):
+                be = str(c.get("BackExtra", "")).strip()
+                c["back"] = be if be else "(cloze answer on reveal)"
+        c["front"] = str(c.get("front", "")).strip()
+        c["back"]  = str(c.get("back",  "")).strip()
+        normalized.append(c)
+    cards = normalized
+    # ---------------------------------------------------------------
 
-    # Map Anki-style cloze fields to our front/back
-    if typ == "cloze":
-        if not c.get("front") and c.get("Text"):
-            c["front"] = str(c.get("Text", ""))
-        if not c.get("back"):
-            # Prefer provided BackExtra; otherwise add a small placeholder
-            be = str(c.get("BackExtra", "")).strip()
-            c["back"] = be if be else "(cloze answer on reveal)"
-
-    # Ensure required keys exist as strings
-    c["front"] = str(c.get("front", "")).strip()
-    c["back"]  = str(c.get("back",  "")).strip()
-
-    normalized.append(c)
-cards = normalized
-# --- End normalization ---
-
-    # Validate and normalize
+    # Validate and normalize HTML
     cards = [c for c in cards if valid_card(c)]
     for c in cards:
         typ = (c.get("type") or "basic").lower()
@@ -383,7 +630,6 @@ cards = normalized
     data["deck"]["card_count_planned"] = len(cards)
     data["cards"] = cards
     return data
-
 
 def generate_assessment(topic: str, goal: str, idioma: str, nivel: str,
                         tipos: list, digest: str, domain_kws: List[str],
@@ -415,236 +661,8 @@ def generate_assessment(topic: str, goal: str, idioma: str, nivel: str,
 
 
 # -------------------------
-# Validation & variety
+# Anki models & deck builder
 # -------------------------
-REQUIRED_CARD_FIELDS = {"type", "front", "back"}
-
-def strip_html_to_plain(s: str) -> str:
-    if not s:
-        return ""
-    s2 = re.sub(r"<[^>]+>", " ", s)
-    s2 = (s2.replace("&nbsp;", " ").replace("&amp;", "&")
-           .replace("&lt;", "<").replace("&gt;", ">"))
-    s2 = re.sub(r"\s+", " ", s2).strip()
-    return s2
-
-
-def valid_card(c: dict) -> bool:
-    if not isinstance(c, dict):
-        return False
-    if not all(k in c and (c[k] is not None and len(str(c[k]).strip()) > 0) for k in REQUIRED_CARD_FIELDS):
-        return False
-    typ = (c.get("type") or "").lower()
-if typ == "cloze":
-    # Accept either our normalized 'front' or raw Anki 'Text'
-    cloze_src = c.get("front", "") or c.get("Text", "")
-    if "{{c" not in cloze_src:
-        return False
-
-def dedupe_cards(cards: list) -> list:
-    def sig(c):
-        t = (c.get("type") or "").lower().strip()
-        f = (c.get("front") or c.get("Text") or "").strip().lower()
-        b = (c.get("back") or c.get("BackExtra") or "").strip().lower()
-        return hashlib.md5(f"{t}|{f[:160]}|{b[:160]}".encode()).hexdigest()
-
-    seen, out = set(), []
-    for c in (cards or []):
-        if not isinstance(c, dict):
-            continue
-        s = sig(c)
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(c)
-    return out
-
-
-def contains_domain_keyword(card: dict, kws: List[str]) -> bool:
-    if not kws:
-        return True
-    blob = f"{card.get('front','')} | {card.get('back','')}".lower()
-    return any(k in blob for k in kws[:40])
-
-
-def kind_of(c: dict) -> str:
-    t = (c.get("type") or "").lower()
-    if t == "cloze":
-        return "cloze"
-    f = (c.get("front") or "").lower()
-    if "?" in f:
-        return "qa"
-    if any(k in f for k in ["scenario:", "cenário:", "case:", "caso:"]):
-        return "scenario"
-    if any(k in f for k in ["procedure", "procedimento", "step", "passo", "ordem"]):
-        return "procedure"
-    return "basic"
-
-
-def anchored_to_source(card: dict) -> bool:
-    src = card.get("source_ref") or {}
-    return bool(src.get("file") or src.get("page_or_time"))
-
-
-def enforce_variety(cards: List[dict], kws: List[str], max_qa_frac: float,
-                    require_anchor_effective: bool, seed_ids: set) -> List[dict]:
-    filtered: List[dict] = []
-    for c in cards:
-        if require_anchor_effective and not anchored_to_source(c) and c.get("id") not in seed_ids:
-            continue
-        if not contains_domain_keyword(c, kws) and c.get("id") not in seed_ids:
-            continue
-        filtered.append(c)
-    if not filtered:
-    # Fall back instead of returning zero — preserves preview UX
-    return cards
-    total = max(1, len(filtered))
-    qa_idx = [i for i, c in enumerate(filtered) if kind_of(c) == "qa" and c.get("id") not in seed_ids]
-    max_qa = int(max_qa_frac * total)
-    if len(qa_idx) > max_qa:
-        drop = set(qa_idx[max_qa:])
-        filtered = [c for i, c in enumerate(filtered) if i not in drop]
-    return filtered
-
-
-# -------------------------
-# Anki models & helpers
-# -------------------------
-def slugify(text: str, maxlen: int = 64) -> str:
-    t = unidecode(text or "").lower()
-    t = re.sub(r"[^\w\s-]", "", t)
-    t = re.sub(r"[\s-]+", "-", t).strip("-")
-    return t[:maxlen] or f"slug-{int(time.time())}"
-
-
-def html_escape(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def normalize_text_for_html(s: str, cloze: bool = False) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip()
-    s = re.sub(r"^```+|\n```+$", "", s)
-    if cloze:
-        s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    else:
-        s = html_escape(s)
-    s = s.replace("\n", "<br>")
-    return s
-
-
-def examples_to_html(examples: Optional[List[Dict[str, str]]]) -> str:
-    if not examples:
-        return ""
-    items: List[str] = []
-    for ex in examples:
-        if not isinstance(ex, dict):
-            continue
-        line = html_escape(ex.get("text", ""))
-        tr = ex.get("translation")
-        nt = ex.get("notes")
-        if tr:
-            line += f' <span class="tr">({html_escape(tr)})</span>'
-        if nt:
-            line += f' <span class="nt">[{html_escape(nt)}]</span>'
-        items.append(f"<li>{line}</li>")
-    return "<ul class='examples-list'>" + "".join(items) + "</ul>"
-
-
-def map_lang_for_gtts(language_code: str) -> str:
-    langs = tts_langs()
-    if not language_code:
-        return "en"
-    lc = language_code.lower()
-    prefs = {
-        "fr": ["fr"], "pt": ["pt", "pt-br"], "en": ["en", "en-us", "en-gb"],
-        "es": ["es"], "de": ["de"], "it": ["it"],
-        "zh": ["zh", "zh-cn", "cmn-cn", "zh-tw"], "ja": ["ja"],
-    }
-    for k, choices in prefs.items():
-        if lc.startswith(k):
-            for code in choices:
-                if code in langs:
-                    return code
-    for cand in (lc, lc.replace("_", "-")):
-        if cand in langs:
-            return cand
-    return "en"
-
-
-def synth_audio(text: str, lang_code: str) -> Optional[bytes]:
-    t = (text or "").strip()
-    if not t or len(t) > AUDIO_CHAR_LIMIT:
-        return None
-    try:
-        fp = io.BytesIO()
-        gTTS(text=t, lang=map_lang_for_gtts(lang_code)).write_to_fp(fp)
-        return fp.getvalue()
-    except Exception:
-        return None
-
-
-def _clean_tag(tag) -> str:
-    t = str(tag or "").strip().lower()
-    t = re.sub(r"\s+", "-", t)
-    t = re.sub(r"[^a-z0-9_\-:]", "", t)
-    return t[:40]
-
-
-def sanitize_tags(tags) -> list:
-    if not isinstance(tags, list):
-        return []
-    out, seen = [], set()
-    for t in tags:
-        ct = _clean_tag(t)
-        if ct and ct not in seen:
-            out.append(ct); seen.add(ct)
-        if len(out) >= 12:
-            break
-    return out
-
-
-QUESTION_WORDS = {
-    "fr": ["qui","que","quoi","quel","quelle","quels","quelles","où","quand","comment","pourquoi","combien"],
-    "pt": ["o que","qual","quais","quando","onde","como","por que","por quê","quem","quanto","quantos","quantas"],
-    "en": ["what","which","when","where","how","why","who","whom","whose"],
-}
-def _lang_prefix(lang: str) -> str:
-    l = (lang or "en").lower()
-    for k in ["fr","pt","en","es","de","it"]:
-        if l.startswith(k): return k
-    return "en"
-
-
-def looks_like_question(text: str, lang: str) -> bool:
-    if not text:
-        return False
-    t = text.strip()
-    if "?" in t:
-        return True
-    lp = _lang_prefix(lang)
-    w = re.sub(r'^[\-\•\–\s]+', '', t.lower())
-    return any(w.startswith(q + " ") or w == q for q in QUESTION_WORDS.get(lp, []))
-
-
-def orient_q_a(card: Dict[str, Any], lang: str) -> Tuple[str, str]:
-    f = (card.get("front") or card.get("Text") or "").strip()
-    b = (card.get("back") or card.get("BackExtra") or "").strip()
-    fq, bq = looks_like_question(f, lang), looks_like_question(b, lang)
-    if fq and not bq: return f, b
-    if bq and not fq: return b, f
-    if len(f) > len(b): return b, f
-    return f, b
-
-
-def stable_model_id(name: str, version: int = 3) -> int:
-    h = hashlib.sha1(f"{name}-v{version}".encode("utf-8")).hexdigest()
-    return int(h[:10], 16)
-
-
 COMMON_CSS = """
 .card { font-family: -apple-system, Segoe UI, Roboto, Arial; font-size: 20px; text-align: left; color: #222; background: #fff; }
 .front { font-size: 1.05em; line-height: 1.45; }
@@ -658,7 +676,10 @@ COMMON_CSS = """
 hr { margin: 14px 0; }
 """
 
-# BASIC & REVERSE models
+def stable_model_id(name: str, version: int = 3) -> int:
+    h = hashlib.sha1(f"{name}-v{version}".encode("utf-8")).hexdigest()
+    return int(h[:10], 16)
+
 MODEL_BASIC = genanki.Model(
     stable_model_id("Anki-Chat Basic", version=3), "Anki-Chat Basic (v3)",
     fields=[
@@ -702,7 +723,6 @@ MODEL_REVERSE = genanki.Model(
     css=COMMON_CSS
 )
 
-# CLOZE model requires field "Text"
 MODEL_CLOZE = genanki.Model(
     stable_model_id("Anki-Chat Cloze", version=3), "Anki-Chat Cloze (v3)",
     fields=[
@@ -722,11 +742,9 @@ MODEL_CLOZE = genanki.Model(
     model_type=genanki.Model.CLOZE
 )
 
-
 def build_deck_id(title: str) -> int:
     h = hashlib.sha1(title.encode("utf-8")).hexdigest()
     return int(h[:10], 16)
-
 
 def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str, back_raw: str) -> Optional[str]:
     if policy == "none":
@@ -749,7 +767,6 @@ def choose_tts_text(card: Dict[str, Any], policy: str, lang: str, front_raw: str
         if t:
             return t
     return None
-
 
 def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples",
                      tts_coverage: str = "sampled", default_tag: str = "") -> bytes:
@@ -820,7 +837,6 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples",
         guid = genanki.guid_for(front, back)
 
         if ctype == "cloze":
-            # Cloze expects "Text" then "BackExtra"
             note = genanki.Note(model=MODEL_CLOZE,
                                 fields=[front, back, hint, examples_html, audio_field, extra],
                                 tags=tags, guid=guid)
@@ -834,11 +850,11 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples",
                                 tags=tags, guid=guid)
         deck.add_note(note)
 
-    progress_bar = st.progress(0.0, text="Building Anki deck...")
+    progress_bar = st.progress(0)
     for i, c in enumerate(cards):
         if isinstance(c, dict):
             add_note(c, i)
-        progress_bar.progress((i + 1) / max(1, len(cards)), text=f"Adding card {i+1} of {len(cards)}...")
+        progress_bar.progress(int(((i + 1) / max(1, len(cards))) * 100))
     progress_bar.empty()
 
     pkg = genanki.Package(deck)
@@ -853,7 +869,7 @@ def build_apkg_bytes(deck_json: Dict[str, Any], tts_policy: str = "examples",
 
 
 # -------------------------
-# Preview & stats
+# Stats & rendering
 # -------------------------
 def deck_stats(cards, domain_kws=None):
     kinds = [kind_of(c) for c in cards]
@@ -873,7 +889,6 @@ def deck_stats(cards, domain_kws=None):
         "anchored_pct": anch,
         "coverage_pct": cover
     }
-
 
 def render_card_preview(c: Dict[str, Any], lang: str) -> str:
     typ = (c.get("type") or "basic").title()
@@ -901,320 +916,421 @@ def render_card_preview(c: Dict[str, Any], lang: str) -> str:
 
 
 # -------------------------
-# Session state
+# UX helpers
 # -------------------------
-def ss_init(k, v):
-    if k not in st.session_state:
-        st.session_state[k] = v
+def stepper():
+    st.markdown("<div class='step'><span class='title'>1) Plan</span> <span class='badge'>Assessment</span><br><span class='help'>Set topic/goal/language. (Optional) Add sources to anchor.</span></div>", unsafe_allow_html=True)
+    st.markdown("<div class='step'><span class='title'>2) Preview</span> <span class='badge'>Sample cards</span><br><span class='help'>Review & edit a small sample. Approved rows become seed cards.</span></div>", unsafe_allow_html=True)
+    st.markdown("<div class='step'><span class='title'>3) Build</span> <span class='badge'>.apkg export</span><br><span class='help'>Generate full deck with optional TTS and download.</span></div>", unsafe_allow_html=True)
 
-for k, v in [
-    ("messages", []),
-    ("topic", ""),
-    ("deck_title", ""),
-    ("goal", "Language: Vocabulary"),
-    ("idioma", "fr-FR"),
-    ("nivel", "B1"),
-    ("tipos", ["basic", "reverse", "cloze"]),
-    ("target_n", 36),
-    ("max_qa_pct", 0.45),
-    ("require_anchor", True),
-    ("default_tag", ""),
-    ("materials", []),
-    ("urls_text", ""),
-    ("youtube_urls_text", ""),
-    ("digest", ""),
-    ("chosen_sections_meta", []),
-    ("domain_kws", []),
-    ("assessment", None),
-    ("assessment_ok", False),
-    ("preview_cards", []),
-    ("approved_cards", []),
-    ("tts_mode", "examples"),
-    ("tts_cov", "sampled"),
-    ("manual_mode", False),
-]:
-    ss_init(k, v)
-
-
-# -------------------------
-# Streamlit UI & Logic
-# -------------------------
-def say(role, content):
-    st.session_state.messages.append({"role": role, "content": content})
-    with st.chat_message(role):
-        st.markdown(content)
-
-if not st.session_state.messages:
-    say("assistant", "Tell me your learning goal or topic (e.g., *French past tenses*, *Org security policy basics*, *Exam prep: CISSP Domain 1*). I’ll propose a plan, then show a preview.")
-
-with st.expander("📎 (Optional) Add materials for better anchoring"):
-    st.write("Attach PDFs/DOCX/TXT/MD, paste URLs, or add YouTube video links. Not required.")
-    upl = st.file_uploader("Files", type=["pdf", "docx", "txt", "md", "markdown"], accept_multiple_files=True)
-    url_lines = st.text_area("URLs (one per line)", st.session_state.urls_text, height=80)
-    youtube_urls = st.text_area("YouTube URLs (one per line)", st.session_state.youtube_urls_text, height=80)
-    colm1, colm2 = st.columns(2)
-    if colm1.button("Add sources"):
-        with st.spinner("Processing sources..."):
-            mats = ingest_files(upl) if upl else []
-            if url_lines.strip():
-                st.session_state.urls_text = url_lines
-                urls = [u.strip() for u in url_lines.splitlines() if u.strip()]
-                mats += ingest_urls(urls)
-            if youtube_urls.strip() and YOUTUBE_DEPS_OK:
-                st.session_state.youtube_urls_text = youtube_urls
-                yt_urls = [u.strip() for u in youtube_urls.splitlines() if u.strip()]
-                for u in yt_urls:
-                    yt_mat = ingest_youtube_transcript(u) or []
-                    mats += yt_mat
-            if mats:
-                st.session_state.materials.extend(mats)
-                st.toast(f"Added {len(mats)} new sources!", icon="✅")
-            else:
-                st.toast("No new sources added.", icon="ℹ️")
-    if colm2.button("Clear sources"):
-        st.session_state.materials = []
-        st.session_state.digest = ""
-        st.session_state.chosen_sections_meta = []
-        st.toast("Sources cleared.", icon="🗑️")
-
-user_text = st.chat_input("Describe your topic, ask for preview, or say 'build deck'. You can also say 'set size 80', 'language en-US', etc.")
-if user_text:
-    say("user", user_text)
+def apply_chat_commands(user_text: str):
+    # lightweight command parsing from chat
     m = re.search(r"\bset size\s+(\d{1,3})\b", user_text.lower())
     if m:
-        st.session_state.target_n = max(4, min(200, int(m.group(1))))
-        say("assistant", f"Target size set to **{st.session_state.target_n}** cards.")
-    m = re.search(r"\blang(uage)?\s+([A-Za-z\-]{2,6})", user_text.lower())
+        st.session_state["target_n"] = max(4, min(200, int(m.group(1))))
+        st.toast(f"Target size set to {st.session_state['target_n']} cards.", icon="✅")
+    m = re.search(r"\blang(uage)?\s+([A-Za-z\-]{2,8})", user_text.lower())
     if m:
-        st.session_state.idioma = m.group(2)
-        say("assistant", f"Deck language set to **{st.session_state.idioma}**.")
+        st.session_state["idioma"] = m.group(2)
+        st.toast(f"Deck language set to {st.session_state['idioma']}.", icon="✅")
     if re.search(r"\b(goal|mode)\b.*(policy|exam|vocab|grammar)", user_text.lower()):
-        if "policy" in user_text.lower(): st.session_state.goal = "Org policy mastery"
-        elif "exam" in user_text.lower(): st.session_state.goal = "Exam prep"
-        elif "vocab" in user_text.lower(): st.session_state.goal = "Language: Vocabulary"
-        elif "grammar" in user_text.lower(): st.session_state.goal = "Language: Grammar & Patterns"
-        say("assistant", f"Goal set to **{st.session_state.goal}**.")
-    if not st.session_state.topic.strip():
-        st.session_state.topic = user_text.strip()
-        st.session_state.deck_title = st.session_state.deck_title or st.session_state.topic[:48]
-        say("assistant", f"Got it. Proposed title: **{st.session_state.deck_title}**.\n\nI’ll draft a short plan…")
-
-    # Build digest/keywords
-    if st.session_state.materials:
-        digest, chosen = rag_digest(st.session_state.materials, st.session_state.topic, "", top_k=6)
-        st.session_state.digest = digest
-        st.session_state.chosen_sections_meta = chosen
-        toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9\-_/\.]{4,}", digest.lower())
-        st.session_state.domain_kws = list(dict.fromkeys(toks))[:40]
-    else:
-        st.session_state.digest = ""
-        toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9\-_/\.]{4,}", st.session_state.topic.lower())
-        st.session_state.domain_kws = list(dict.fromkeys(toks))[:20]
-
-    asked_preview = bool(re.search(r"\b(preview|show sample|sample)\b", user_text.lower()))
-    asked_build = bool(re.search(r"\b(build|make deck|generate deck|export)\b", user_text.lower()))
-
-    if (st.session_state.assessment is None) or ("plan" in user_text.lower()):
-        a = generate_assessment(
-            st.session_state.topic, st.session_state.goal, st.session_state.idioma, st.session_state.nivel,
-            st.session_state.tipos, st.session_state.digest, st.session_state.domain_kws,
-            st.session_state.max_qa_pct, st.session_state.require_anchor
-        )
-        st.session_state.assessment = a
-        plan_md = [
-            f"**Summary:** {a.get('summary','')}",
-            "**Key issues:**",
-            *[f"- {x}" for x in (a.get('key_issues') or [])],
-            f"**Card type strategy (%):** `{json.dumps(a.get('card_type_strategy',{}))}`",
-            f"**Anchoring:** {a.get('anchoring_plan','')}",
-            f"**Terminology focus:** `{', '.join(a.get('terminology_focus', []))}`",
-            "**Open questions:**",
-            *[f"- {x}" for x in (a.get('open_questions') or ['(none)'])],
-            "_Reply with changes (e.g., 'more cloze on exceptions', 'add scenarios', 'reduce Q&A'), or say **preview** / **build**._"
-        ]
-        say("assistant", "\n".join(plan_md))
-
-    st.session_state.pending_preview = asked_preview
-    st.session_state.pending_build = asked_build
-
-colact1, colact2, colact3 = st.columns([1, 1, 2])
-do_preview = colact1.button("🔎 Preview")
-do_build = colact2.button("🏗️ Build deck")
-prev_size = colact3.selectbox("Preview size", [1, 2, 3, 4, 5], index=1)
+        if "policy" in user_text.lower(): st.session_state["goal"] = "Org policy mastery"
+        elif "exam" in user_text.lower(): st.session_state["goal"] = "Exam prep"
+        elif "vocab" in user_text.lower(): st.session_state["goal"] = "Language: Vocabulary"
+        elif "grammar" in user_text.lower(): st.session_state["goal"] = "Language: Grammar & Patterns"
+        st.toast(f"Goal set to {st.session_state['goal']}.", icon="✅")
 
 def require_anchor_effective() -> bool:
-    return bool(st.session_state.require_anchor and (st.session_state.materials or st.session_state.digest))
+    return bool(st.session_state.get("require_anchor", True) and (st.session_state.get("materials") or st.session_state.get("digest")))
 
 def make_payload(n_cards: int, seed_cards=None):
     return {
-        "deck_title": st.session_state.deck_title or "Anki Deck",
-        "idioma_alvo": st.session_state.idioma,
-        "nivel_proficiencia": st.session_state.nivel,
-        "topico": st.session_state.topic or "(no topic)",
+        "deck_title": st.session_state.get("deck_title") or "Anki Deck",
+        "idioma_alvo": st.session_state.get("idioma", "en"),
+        "nivel_proficiencia": st.session_state.get("nivel", ""),
+        "topico": st.session_state.get("topic") or "(no topic)",
         "limite_cartoes": n_cards,
-        "tipos_permitidos": st.session_state.tipos,
-        "politica_voz": f"tts={st.session_state.tts_mode}",
-        "materials_digest": st.session_state.digest,
+        "tipos_permitidos": st.session_state.get("tipos", ["basic","reverse","cloze"]),
+        "politica_voz": f"tts={st.session_state.get('tts_mode','examples')}",
+        "materials_digest": st.session_state.get("digest",""),
         "extra_policy": "usage_tip",
-        "goal": st.session_state.goal,
-        "max_qa_pct": st.session_state.max_qa_pct,
+        "goal": st.session_state.get("goal","Language: Vocabulary"),
+        "max_qa_pct": st.session_state.get("max_qa_pct", 0.45),
         "require_anchor": require_anchor_effective(),
-        "domain_keywords": st.session_state.domain_kws[:30],
+        "domain_keywords": (st.session_state.get("domain_kws") or [])[:30],
         "user_feedback": "",
         "seed_cards": seed_cards or [],
-        "assessment_plan": st.session_state.assessment or {},
-        "assessment_approved": bool(st.session_state.assessment_ok),
+        "assessment_plan": st.session_state.get("assessment") or {},
+        "assessment_approved": bool(st.session_state.get("assessment_ok")),
     }
 
 def build_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = gerar_baralho(payload)
     cards = dedupe_cards(data.get("cards", []))
     seed_ids = {c.get("id") for c in payload.get("seed_cards", []) if c.get("id")}
-    cards = enforce_variety(cards, st.session_state.domain_kws, payload["max_qa_pct"], payload["require_anchor"], seed_ids)
+    cards = enforce_variety(cards, st.session_state.get("domain_kws", []), payload["max_qa_pct"], payload["require_anchor"], seed_ids)
     data["cards"] = (cards or [])[: payload["limite_cartoes"]]
     data["deck"]["card_count_planned"] = len(data["cards"])
     return data
 
-if st.session_state.get("pending_preview") or do_preview:
-    if not st.session_state.topic.strip():
-        say("assistant", "Please describe a topic first.")
+def reset_all():
+    for k in list(st.session_state.keys()):
+        if k not in ["mode"]:  # keep mode
+            del st.session_state[k]
+    # reinit
+    for k, v in [
+        ("messages", []),
+        ("topic", ""),
+        ("deck_title", ""),
+        ("goal", "Language: Vocabulary"),
+        ("idioma", "fr-FR"),
+        ("nivel", "B1"),
+        ("tipos", ["basic", "reverse", "cloze"]),
+        ("target_n", 36),
+        ("max_qa_pct", 0.45),
+        ("require_anchor", True),
+        ("default_tag", ""),
+        ("materials", []),
+        ("urls_text", ""),
+        ("youtube_urls_text", ""),
+        ("digest", ""),
+        ("chosen_sections_meta", []),
+        ("domain_kws", []),
+        ("assessment", None),
+        ("assessment_ok", False),
+        ("preview_cards", []),
+        ("approved_cards", []),
+        ("tts_mode", "examples"),
+        ("tts_cov", "sampled"),
+        ("pending_preview", False),
+        ("pending_build", False),
+    ]:
+        ss_init(k, v)
+
+
+# -------------------------
+# Layout
+# -------------------------
+header_l, header_r = st.columns([3,2])
+with header_l:
+    st.title("🧠 Chat Anki Deck Creator")
+    st.caption("Plan → Preview → Build high-quality Anki decks from topics or documents. Anchors to your sources when provided.")
+with header_r:
+    with st.container():
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Target", st.session_state["target_n"])
+        with cols[1]:
+            st.metric("Max Q&A %", f"{int(st.session_state['max_qa_pct']*100)}%")
+        with cols[2]:
+            st.metric("Mode", st.session_state["mode"])
+
+top_cols = st.columns([1,1,2,1])
+with top_cols[0]:
+    st.session_state["mode"] = st.radio("Mode", ["Chat","Form"], horizontal=True, index=["Chat","Form"].index(st.session_state["mode"]))
+with top_cols[1]:
+    if st.button("🔄 Reset session"):
+        reset_all()
+        st.experimental_rerun()
+with top_cols[2]:
+    st.write("")
+    st.caption("Tip: In chat you can say “**language en-US**”, “**set size 80**”, “**preview**”, or “**build**”.")
+with top_cols[3]:
+    pass
+
+st.divider()
+left, right = st.columns([2,1])
+
+with right:
+    st.subheader("📎 Sources (optional)")
+    with st.expander("Add / Manage Sources", expanded=False):
+        upl = st.file_uploader("Upload files", type=["pdf","docx","txt","md","markdown"], accept_multiple_files=True)
+        url_lines = st.text_area("URLs (one per line)", st.session_state["urls_text"], height=80)
+        youtube_urls = st.text_area("YouTube URLs (one per line)", st.session_state["youtube_urls_text"], height=80)
+        c1, c2 = st.columns(2)
+        if c1.button("Add sources"):
+            with st.spinner("Processing sources..."):
+                mats = ingest_files(upl) if upl else []
+                if url_lines.strip():
+                    st.session_state["urls_text"] = url_lines
+                    urls = [u.strip() for u in url_lines.splitlines() if u.strip()]
+                    mats += ingest_urls(urls)
+                if youtube_urls.strip() and YOUTUBE_DEPS_OK:
+                    st.session_state["youtube_urls_text"] = youtube_urls
+                    yt_urls = [u.strip() for u in youtube_urls.splitlines() if u.strip()]
+                    for u in yt_urls:
+                        yt_mat = ingest_youtube_transcript(u) or []
+                        mats += yt_mat
+                if mats:
+                    st.session_state["materials"].extend(mats)
+                    st.toast(f"Added {len(mats)} new sources!", icon="✅")
+                else:
+                    st.toast("No new sources added.", icon="ℹ️")
+        if c2.button("Clear sources"):
+            st.session_state["materials"] = []
+            st.session_state["digest"] = ""
+            st.session_state["chosen_sections_meta"] = []
+            st.toast("Sources cleared.", icon="🗑️")
+
+    if st.session_state["materials"]:
+        st.markdown("**Current sources**")
+        for m in st.session_state["materials"]:
+            st.markdown(f"<span class='source-chip'>{m['file']}</span>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("⚙️ Build Settings")
+    st.session_state["tts_mode"] = st.selectbox("TTS", ["none","answers","examples","all"], index=["none","answers","examples","all"].index(st.session_state["tts_mode"]))
+    st.session_state["tts_cov"] = st.selectbox("TTS coverage", ["sampled","all"], index=["sampled","all"].index(st.session_state["tts_cov"]))
+    st.session_state["default_tag"] = st.text_input("Default tag", st.session_state["default_tag"] or slugify(st.session_state.get("topic","")))
+    st.session_state["require_anchor"] = st.checkbox("Require anchoring (auto-disabled if no materials)", value=st.session_state["require_anchor"])
+    st.session_state["max_qa_pct"] = st.slider("Max % Q&A", 10, 90, int(st.session_state["max_qa_pct"]*100), 5)/100.0
+    st.session_state["target_n"] = st.slider("Target cards", 4, 200, st.session_state["target_n"], 2)
+
+with left:
+    stepper()
+    st.subheader("1) Plan")
+    plan_cols = st.columns(2)
+    with plan_cols[0]:
+        st.session_state["topic"] = st.text_input("Topic", st.session_state["topic"])
+        st.session_state["deck_title"] = st.text_input("Deck title", st.session_state["deck_title"] or st.session_state["topic"][:48])
+        st.session_state["idioma"] = st.text_input("Language code", st.session_state["idioma"])
+    with plan_cols[1]:
+        st.session_state["nivel"] = st.text_input("Level", st.session_state["nivel"])
+        st.session_state["goal"] = st.selectbox("Goal", ["General learning","Org policy mastery","Exam prep","Language: Vocabulary","Language: Grammar & Patterns"],
+                                                index=["General learning","Org policy mastery","Exam prep","Language: Vocabulary","Language: Grammar & Patterns"].index(st.session_state["goal"]))
+        st.session_state["tipos"] = st.multiselect("Allowed types", ["basic","reverse","cloze"], default=st.session_state["tipos"])
+
+    # Build digest/keywords if materials exist
+    if st.session_state["materials"]:
+        digest, chosen = rag_digest(st.session_state["materials"], st.session_state["topic"], "", top_k=6)
+        st.session_state["digest"] = digest
+        st.session_state["chosen_sections_meta"] = chosen
+        toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9\-_/\.]{4,}", digest.lower())
+        st.session_state["domain_kws"] = list(dict.fromkeys(toks))[:40]
     else:
-        with st.spinner("Drafting preview…"):
+        st.session_state["digest"] = ""
+        toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9\-_/\.]{4,}", (st.session_state["topic"] or "").lower())
+        st.session_state["domain_kws"] = list(dict.fromkeys(toks))[:20]
+
+    plan_actions = st.columns([1,1,1,2])
+    gen_plan = plan_actions[0].button("🧭 Generate plan")
+    do_preview_btn = plan_actions[1].button("🔎 Preview")
+    do_build_btn = plan_actions[2].button("🏗️ Build")
+
+    if gen_plan:
+        if not st.session_state["topic"].strip():
+            st.warning("Add a topic first.")
+        else:
+            a = generate_assessment(
+                st.session_state["topic"], st.session_state["goal"], st.session_state["idioma"], st.session_state["nivel"],
+                st.session_state["tipos"], st.session_state["digest"], st.session_state["domain_kws"],
+                st.session_state["max_qa_pct"], st.session_state["require_anchor"]
+            )
+            st.session_state["assessment"] = a
+            st.session_state["assessment_ok"] = True
+            st.success("Plan generated.")
+    if st.session_state["assessment"]:
+        a = st.session_state["assessment"]
+        st.markdown("**Assessment plan**")
+        st.json(a, expanded=False)
+
+    st.markdown("---")
+    st.subheader("2) Preview")
+    prev_size = st.selectbox("Preview size", [1,2,3,4,5], index=1, help="Small sample to review/edit before full build.")
+
+    if do_preview_btn:
+        if not st.session_state["topic"].strip():
+            st.warning("Add a topic first.")
+        else:
             payload = make_payload(prev_size)
             data = build_sample(payload)
-            st.session_state.preview_cards = data.get("cards", [])
-            stats = deck_stats(st.session_state.preview_cards, st.session_state.domain_kws)
-            say("assistant",
-                f"Preview ready ({len(st.session_state.preview_cards)} cards). "
-                f"Mix — Q&A {stats['qa_pct']:.0f}%, Cloze {stats['cloze_pct']:.0f}%, "
-                f"Scenario {stats['scenario_pct']:.0f}%, Procedure {stats['procedure_pct']:.0f}%. "
-                f"Anchored {stats['anchored_pct']:.0f}%.")
-    st.session_state.pending_preview = False
+            st.session_state["preview_cards"] = data.get("cards", [])
+            stats = deck_stats(st.session_state["preview_cards"], st.session_state["domain_kws"])
+            st.info(f"Preview ready ({len(st.session_state['preview_cards'])} cards). "
+                    f"Mix — Q&A {stats['qa_pct']:.0f}%, Cloze {stats['cloze_pct']:.0f}%, "
+                    f"Scenario {stats['scenario_pct']:.0f}%, Procedure {stats['procedure_pct']:.0f}%. "
+                    f"Anchored {stats['anchored_pct']:.0f}%.")
 
-if st.session_state.preview_cards:
-    deck_lang = st.session_state.idioma
-    cols = st.columns(2)
-    for i, c in enumerate(st.session_state.preview_cards):
-        html = render_card_preview(c, deck_lang)
-        (cols[i % 2]).markdown(html, unsafe_allow_html=True)
+    if st.session_state["preview_cards"]:
+        deck_lang = st.session_state["idioma"]
+        cols = st.columns(2)
+        for i, c in enumerate(st.session_state["preview_cards"]):
+            html = render_card_preview(c, deck_lang)
+            (cols[i % 2]).markdown(html, unsafe_allow_html=True)
 
-    if pd:
-        st.markdown("**Approve / edit preview** *(kept rows become seed cards for the final deck)*")
+        st.caption("Approve/edit the sample (kept rows become seed cards for the final deck).")
+        if pd:
+            def cards_to_df(cards):
+                rows = []
+                for c in cards:
+                    rows.append({
+                        "keep": True,
+                        "type": c.get("type","basic"),
+                        "front": strip_html_to_plain(c.get("front") or c.get("Text","")),
+                        "back":  strip_html_to_plain(c.get("back") or c.get("BackExtra","")),
+                        "hint": c.get("hint",""),
+                        "tags": ",".join(sanitize_tags(c.get("tags",[])))
+                    })
+                return pd.DataFrame(rows)
+            def df_to_cards(df):
+                out = []
+                for _,r in df.iterrows():
+                    if not r.get("keep",False): continue
+                    tags = sanitize_tags([t.strip() for t in str(r.get("tags","")).split(",") if t.strip()])
+                    cid = f"seed-{hashlib.md5((str(r['type'])+str(r['front'])).encode()).hexdigest()[:8]}"
+                    out.append({
+                        "id": cid,
+                        "type": r["type"],
+                        "front": normalize_text_for_html(r["front"], cloze=(r["type"]=="cloze")),
+                        "back":  normalize_text_for_html(r["back"]),
+                        "hint":  html_escape(r.get("hint","")),
+                        "examples": [],
+                        "tags": tags,
+                        "source_ref": {}, "rationale": ""
+                    })
+                return out
+            df = cards_to_df(st.session_state["preview_cards"])
+            edited = st.data_editor(df, use_container_width=True, num_rows="fixed", key="preview_editor")
+            st.session_state["approved_cards"] = df_to_cards(edited)
+        else:
+            # Minimal fallback if pandas isn't installed
+            keep_options = [st.checkbox(f"Keep card {i+1}", value=True, key=f"keep_{i}") for i in range(len(st.session_state["preview_cards"]))]
+            approved = []
+            for i, c in enumerate(st.session_state["preview_cards"]):
+                if keep_options[i]:
+                    approved.append(c)
+            st.session_state["approved_cards"] = approved
 
-        def cards_to_df(cards):
-            rows = []
-            for c in cards:
-                rows.append({
-                    "keep": True,
-                    "type": c.get("type", "basic"),
-                    "front": strip_html_to_plain(c.get("front") or c.get("Text", "")),
-                    "back": strip_html_to_plain(c.get("back") or c.get("BackExtra", "")),
-                    "hint": c.get("hint", ""),
-                    "tags": ",".join(sanitize_tags(c.get("tags", [])))
-                })
-            return pd.DataFrame(rows)
-
-        def df_to_cards(df):
-            out = []
-            for _, r in df.iterrows():
-                if not r.get("keep", False):
-                    continue
-                tags = sanitize_tags([t.strip() for t in str(r.get("tags", "")).split(",") if t.strip()])
-                cid = f"seed-{hashlib.md5((str(r['type'])+str(r['front'])).encode()).hexdigest()[:8]}"
-                out.append({
-                    "id": cid,
-                    "type": r["type"],
-                    "front": normalize_text_for_html(r["front"], cloze=(r["type"] == "cloze")),
-                    "back": normalize_text_for_html(r["back"]),
-                    "hint": html_escape(r.get("hint", "")),
-                    "examples": [],
-                    "tags": tags,
-                    "source_ref": {}, "rationale": ""
-                })
-            return out
-
-        df = cards_to_df(st.session_state.preview_cards)
-        edited = st.data_editor(df, use_container_width=True, num_rows="fixed", key="preview_editor")
-        st.session_state.approved_cards = df_to_cards(edited)
-
-if st.session_state.get("pending_build") or do_build:
-    if not st.session_state.topic.strip():
-        say("assistant", "Please describe a topic first.")
-    else:
-        with st.spinner("Building your deck…"):
-            seeds = st.session_state.approved_cards or []
-            remain = max(0, st.session_state.target_n - len(seeds))
-            if remain > 0:
-                payload = make_payload(remain, seed_cards=seeds)
-                data = gerar_baralho(payload)
-                more = dedupe_cards(data.get("cards", []))
-                seed_ids = {c.get("id") for c in seeds if c.get("id")}
-                more = enforce_variety(more, st.session_state.domain_kws, payload["max_qa_pct"], payload["require_anchor"], seed_ids)
-                cards = dedupe_cards(seeds + (more or []))[: st.session_state.target_n]
-            else:
-                cards = seeds[: st.session_state.target_n]
-
-            deck_json = {
-                "deck": {
-                    "title": st.session_state.deck_title or st.session_state.topic[:48] or "Anki Deck",
-                    "language": st.session_state.idioma,
-                    "level": st.session_state.nivel,
-                    "topic": st.session_state.topic,
-                    "source_summary": ""
-                },
-                "cards": cards
-            }
-            apkg = build_apkg_bytes(
-                deck_json,
-                tts_policy=st.session_state.tts_mode,
-                tts_coverage=("all" if st.session_state.tts_cov.startswith("all") else "sampled"),
-                default_tag=(st.session_state.default_tag or slugify(st.session_state.topic))
-            )
-            fname = f"{slugify(deck_json['deck']['title'])}_{int(time.time())}.apkg"
-            st.success(f"Deck built with {len(deck_json['cards'])} cards!")
-            st.download_button("⬇️ Download .apkg", data=apkg, file_name=fname, mime="application/octet-stream")
-            stats = deck_stats(deck_json["cards"], st.session_state.domain_kws)
-            k1, k2, k3, k4, k5, k6 = st.columns(6)
-            for k, title, val in [
-                (k1, "Cards", f"{stats['total']}"),
-                (k2, "Q&A %", f"{stats['qa_pct']:.0f}%"),
-                (k3, "Cloze %", f"{stats['cloze_pct']:.0f}%"),
-                (k4, "Scenario %", f"{stats['scenario_pct']:.0f}%"),
-                (k5, "Anchored %", f"{stats['anchored_pct']:.0f}%"),
-                (k6, "Coverage", f"{stats['coverage_pct']:.0f}%"),
-            ]:
-                with k:
-                    st.markdown(f"<div class='kpi'><h3>{title}</h3><div class='val'>{val}</div></div>", unsafe_allow_html=True)
-    st.session_state.pending_build = False
-
-with st.sidebar:
     st.markdown("---")
-    st.subheader("🛠️ Manual mode (optional)")
-    st.session_state.manual_mode = st.toggle("Enable manual mode", value=False, help="Use forms instead of chat if you prefer.")
-    if st.session_state.manual_mode:
-        st.session_state.topic = st.text_input("Topic", st.session_state.topic or "")
-        st.session_state.deck_title = st.text_input("Deck title", st.session_state.deck_title or st.session_state.topic[:48])
-        st.session_state.idioma = st.text_input("Language code", st.session_state.idioma)
-        st.session_state.nivel = st.text_input("Level", st.session_state.nivel)
-        st.session_state.goal = st.selectbox(
-            "Goal",
-            ["General learning","Org policy mastery","Exam prep","Language: Vocabulary","Language: Grammar & Patterns"],
-            index=["General learning","Org policy mastery","Exam prep","Language: Vocabulary","Language: Grammar & Patterns"].index(st.session_state.goal)
+    st.subheader("3) Build")
+    if do_build_btn:
+        if not st.session_state["topic"].strip():
+            st.warning("Add a topic first.")
+        else:
+            with st.spinner("Building your deck…"):
+                seeds = st.session_state["approved_cards"] or []
+                remain = max(0, st.session_state["target_n"] - len(seeds))
+                if remain > 0:
+                    payload = make_payload(remain, seed_cards=seeds)
+                    data = gerar_baralho(payload)
+                    more = dedupe_cards(data.get("cards", []))
+                    seed_ids = {c.get("id") for c in seeds if c.get("id")}
+                    more = enforce_variety(more, st.session_state["domain_kws"], payload["max_qa_pct"], payload["require_anchor"], seed_ids)
+                    cards = dedupe_cards(seeds + (more or []))[: st.session_state["target_n"]]
+                else:
+                    cards = seeds[: st.session_state["target_n"]]
+
+                deck_json = {
+                    "deck": {
+                        "title": st.session_state["deck_title"] or st.session_state["topic"][:48] or "Anki Deck",
+                        "language": st.session_state["idioma"],
+                        "level": st.session_state["nivel"],
+                        "topic": st.session_state["topic"],
+                        "source_summary": ""
+                    },
+                    "cards": cards
+                }
+                apkg = build_apkg_bytes(
+                    deck_json,
+                    tts_policy=st.session_state["tts_mode"],
+                    tts_coverage=("all" if st.session_state["tts_cov"].startswith("all") else "sampled"),
+                    default_tag=(st.session_state["default_tag"] or slugify(st.session_state["topic"]))
+                )
+                fname = f"{slugify(deck_json['deck']['title'])}_{int(time.time())}.apkg"
+                st.success(f"Deck built with {len(deck_json['cards'])} cards!")
+                st.download_button("⬇️ Download .apkg", data=apkg, file_name=fname, mime="application/octet-stream")
+                stats = deck_stats(deck_json["cards"], st.session_state["domain_kws"])
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                for k, title, val in [
+                    (k1, "Cards", f"{stats['total']}"),
+                    (k2, "Q&A %", f"{stats['qa_pct']:.0f}%"),
+                    (k3, "Cloze %", f"{stats['cloze_pct']:.0f}%"),
+                    (k4, "Scenario %", f"{stats['scenario_pct']:.0f}%"),
+                    (k5, "Anchored %", f"{stats['anchored_pct']:.0f}%"),
+                    (k6, "Coverage", f"{stats['coverage_pct']:.0f}%"),
+                ]:
+                    with k:
+                        st.markdown(f"<div class='kpi'><h3>{title}</h3><div class='val'>{val}</div></div>", unsafe_allow_html=True)
+
+# -------------------------
+# Chat panel (unified with the same pipeline)
+# -------------------------
+st.divider()
+st.subheader("💬 Chat (optional, same flow)")
+if not st.session_state["messages"]:
+    st.session_state["messages"] = [{"role":"assistant","content":"Tell me your learning goal or topic (e.g., *French past tenses*, *Org security policy basics*, *Exam prep: CISSP Domain 1*). I’ll propose a plan, then show a preview."}]
+
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+user_text = st.chat_input("Say: 'French past tenses', or 'language en-US', or 'preview', or 'build'…")
+if user_text:
+    st.session_state["messages"].append({"role":"user","content":user_text})
+    apply_chat_commands(user_text)
+
+    # lightweight intents
+    asked_preview = bool(re.search(r"\b(preview|show sample|sample)\b", user_text.lower()))
+    asked_build = bool(re.search(r"\b(build|make deck|generate deck|export)\b", user_text.lower()))
+    asked_plan = bool(re.search(r"\b(plan|assessment)\b", user_text.lower()))
+
+    # auto-set topic if empty
+    if not st.session_state["topic"].strip():
+        st.session_state["topic"] = user_text.strip()
+        st.session_state["deck_title"] = st.session_state["deck_title"] or st.session_state["topic"][:48]
+
+    reply_chunks: List[str] = []
+
+    if asked_plan or (st.session_state["assessment"] is None and st.session_state["topic"].strip()):
+        a = generate_assessment(
+            st.session_state["topic"], st.session_state["goal"], st.session_state["idioma"], st.session_state["nivel"],
+            st.session_state["tipos"], st.session_state["digest"], st.session_state["domain_kws"],
+            st.session_state["max_qa_pct"], st.session_state["require_anchor"]
         )
-        st.session_state.tipos = st.multiselect("Allowed types", ["basic", "reverse", "cloze"], default=st.session_state.tipos)
-        st.session_state.target_n = st.slider("Target cards", 4, 200, st.session_state.target_n, 2)
-        st.session_state.max_qa_pct = st.slider("Max % Q&A", 10, 90, int(st.session_state.max_qa_pct*100), 5)/100.0
-        st.session_state.require_anchor = st.checkbox("Require anchoring (auto-disabled if no materials)", value=st.session_state.require_anchor)
-        st.session_state.default_tag = st.text_input("Default tag", st.session_state.default_tag or slugify(st.session_state.topic))
-        st.session_state.tts_mode = st.selectbox("TTS", ["none", "answers", "examples", "all"],
-                                                 index=["none","answers","examples","all"].index(st.session_state.tts_mode))
-        st.session_state.tts_cov = st.selectbox("TTS coverage", ["sampled", "all"],
-                                                index=["sampled","all"].index(st.session_state.tts_cov))
-        colM1, colM2 = st.columns(2)
-        if colM1.button("Preview (manual)"):
-            payload = make_payload(10)
-            data = build_sample(payload)
-            st.session_state.preview_cards = data.get("cards", [])
-        if colM2.button("Build (manual)"):
-            st.session_state.pending_build = True
-            st.experimental_rerun()
+        st.session_state["assessment"] = a
+        st.session_state["assessment_ok"] = True
+        reply_chunks.append("Plan generated. Use **preview** to see sample cards, or **build** to export the deck.")
+
+    if asked_preview:
+        payload = make_payload(3)
+        data = build_sample(payload)
+        st.session_state["preview_cards"] = data.get("cards", [])
+        reply_chunks.append(f"Preview ready: {len(st.session_state['preview_cards'])} card(s).")
+
+    if asked_build:
+        seeds = st.session_state["approved_cards"] or st.session_state["preview_cards"] or []
+        remain = max(0, st.session_state["target_n"] - len(seeds))
+        if remain > 0:
+            payload = make_payload(remain, seed_cards=seeds)
+            data = gerar_baralho(payload)
+            more = dedupe_cards(data.get("cards", []))
+            seed_ids = {c.get("id") for c in seeds if c.get("id")}
+            more = enforce_variety(more, st.session_state["domain_kws"], payload["max_qa_pct"], payload["require_anchor"], seed_ids)
+            cards = dedupe_cards(seeds + (more or []))[: st.session_state["target_n"]]
+        else:
+            cards = seeds[: st.session_state["target_n"]]
+        deck_json = {
+            "deck": {
+                "title": st.session_state["deck_title"] or st.session_state["topic"][:48] or "Anki Deck",
+                "language": st.session_state["idioma"],
+                "level": st.session_state["nivel"],
+                "topic": st.session_state["topic"],
+                "source_summary": ""
+            },
+            "cards": cards
+        }
+        apkg = build_apkg_bytes(
+            deck_json,
+            tts_policy=st.session_state["tts_mode"],
+            tts_coverage=("all" if st.session_state["tts_cov"].startswith("all") else "sampled"),
+            default_tag=(st.session_state["default_tag"] or slugify(st.session_state["topic"]))
+        )
+        fname = f"{slugify(deck_json['deck']['title'])}_{int(time.time())}.apkg"
+        st.session_state["__last_pkg"] = (apkg, fname)
+        reply_chunks.append(f"Deck built with {len(deck_json['cards'])} cards. Scroll up to the Build section to download.")
+
+    if not reply_chunks:
+        reply_chunks.append("Got it. You can say **plan**, **preview**, or **build** — or adjust topic/goal above.")
+
+    st.session_state["messages"].append({"role":"assistant","content":"\n\n".join(reply_chunks)})
+    st.experimental_rerun()
