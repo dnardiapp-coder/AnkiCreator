@@ -1,4 +1,3 @@
-```python
 # app.py — A more robust Chat-First Anki Deck Creator
 # This version implements fixes and features based on a comprehensive technical review.
 
