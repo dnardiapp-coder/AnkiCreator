@@ -1104,9 +1104,6 @@ if do_build:
                 },
                 "cards": cards
             }
-
-            # (mantém o restante igual: build_apkg_bytes, download_button, KPIs etc.)
-
                 apkg = build_apkg_bytes(
                     deck_json,
                     tts_policy=st.session_state["tts_mode"],
