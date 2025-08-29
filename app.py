@@ -1083,24 +1083,30 @@ with left:
             st.session_state["approved_cards"] = [c for i,c in enumerate(st.session_state["preview_cards"]) if keep_opts[i]]
 
     st.markdown("<div class='step'><span class='title'>3) Build</span> <span class='badge'>.apkg export</span><br><span class='help'>Generate full deck with optional TTS and download.</span></div>", unsafe_allow_html=True)
-    do_build = st.button("🏗️ Build deck")
-    if do_build:
-        if not st.session_state["topic"].strip():
-            st.warning("Add a topic first.")
-        else:
-            with st.spinner("Building your deck…"):
-                seeds = st.session_state["approved_cards"] or st.session_state["preview_cards"] or []
-                cards = build_to_target(st.session_state["target_n"], seeds)
-                deck_json = {
-                    "deck": {
-                        "title": st.session_state["deck_title"] or st.session_state["topic"][:48] or "Anki Deck",
-                        "language": st.session_state["idioma"],
-                        "level": st.session_state["nivel"],
-                        "topic": st.session_state["topic"],
-                        "source_summary": ""
-                    },
-                    "cards": cards
-                }
+do_build = st.button("🏗️ Build deck")
+if do_build:
+    if not st.session_state["topic"].strip():
+        st.warning("Add a topic first.")
+    else:
+        with st.spinner("Preparando…"):
+            seeds = st.session_state["approved_cards"] or st.session_state["preview_cards"] or []
+            # NOVO: barra de progresso da geração (por lotes)
+            prog_gen = st.progress(0.0, text="Gerando cartões… 0/0")
+            cards = build_to_target(st.session_state["target_n"], seeds, progress=prog_gen)
+
+            deck_json = {
+                "deck": {
+                    "title": st.session_state["deck_title"] or st.session_state["topic"][:48] or "Anki Deck",
+                    "language": st.session_state["idioma"],
+                    "level": st.session_state["nivel"],
+                    "topic": st.session_state["topic"],
+                    "source_summary": ""
+                },
+                "cards": cards
+            }
+
+            # (mantém o restante igual: build_apkg_bytes, download_button, KPIs etc.)
+
                 apkg = build_apkg_bytes(
                     deck_json,
                     tts_policy=st.session_state["tts_mode"],
