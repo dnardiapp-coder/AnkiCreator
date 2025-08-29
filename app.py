@@ -819,44 +819,75 @@ def build_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
     data["deck"]["card_count_planned"] = len(data["cards"])
     return data
 
-def build_to_target(target_n: int, seed_cards: List[dict], max_rounds: int = 6, batch_cap: int = 24) -> List[dict]:
+def build_to_target(target_n: int, seed_cards: List[dict], max_rounds: int = 6, batch_cap: int = 24, progress=None) -> List[dict]:
     cards = dedupe_cards(seed_cards or [])
-    seen_ids = {hashlib.md5(( (c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest() for c in cards}
+    seen_ids = {hashlib.md5(((c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest() for c in cards}
     rounds = 0
     no_gain_rounds = 0
+
+    # primeira atualização de UI
+    if progress is not None:
+        progress.progress(min(1.0, len(cards)/max(1, target_n)), text=f"Gerando cartões… {len(cards)}/{target_n}")
 
     while len(cards) < target_n and rounds < max_rounds:
         remain = target_n - len(cards)
         ask_n = min(batch_cap, remain)
         seed_hint = cards[-min(20, len(cards)):]
         payload = make_payload(ask_n, seed_cards=seed_hint)
-        data = gerar_baralho(payload); more = dedupe_cards(data.get("cards", []) or [])
 
-        more = enforce_variety(more, st.session_state.get("domain_kws", []), payload["max_qa_pct"], payload["require_anchor"], {c.get("id") for c in seed_hint if c.get("id")}) or []
+        data = gerar_baralho(payload)
+        more = dedupe_cards(data.get("cards", []) or [])
+        more = enforce_variety(
+            more, st.session_state.get("domain_kws", []),
+            payload["max_qa_pct"], payload["require_anchor"],
+            {c.get("id") for c in seed_hint if c.get("id")}
+        ) or []
+
         new_cards = []
         for c in more:
-            sig = hashlib.md5(( (c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest()
-            if sig in seen_ids: continue
-            seen_ids.add(sig); new_cards.append(c)
+            sig = hashlib.md5(((c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest()
+            if sig in seen_ids: 
+                continue
+            seen_ids.add(sig)
+            new_cards.append(c)
 
         if not new_cards:
-            # Relax constraints if stalled
+            # relaxa restrições se travar
             payload["require_anchor"] = False
             payload["max_qa_pct"] = max(payload["max_qa_pct"], 0.9)
             data = gerar_baralho(payload)
             more = dedupe_cards(data.get("cards", []) or [])
             new_cards = []
             for c in more:
-                sig = hashlib.md5(( (c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest()
-                if sig in seen_ids: continue
-                seen_ids.add(sig); new_cards.append(c)
+                sig = hashlib.md5(((c.get('id') or '') + strip_html_to_plain(c.get('front',''))[:120] + strip_html_to_plain(c.get('back',''))[:120]).encode()).hexdigest()
+                if sig in seen_ids:
+                    continue
+                seen_ids.add(sig)
+                new_cards.append(c)
 
         prev_len = len(cards)
         cards = dedupe_cards(cards + new_cards)
-        if len(cards) == prev_len: no_gain_rounds += 1
-        else: no_gain_rounds = 0
+
         rounds += 1
-        if no_gain_rounds >= 2: break
+        if len(cards) == prev_len:
+            no_gain_rounds += 1
+        else:
+            no_gain_rounds = 0
+
+        # atualização a cada rodada
+        if progress is not None:
+            pct = min(1.0, len(cards)/max(1, target_n))
+            progress.progress(pct, text=f"Gerando cartões… {len(cards)}/{target_n} (lote {rounds}/{max_rounds})")
+
+        if no_gain_rounds >= 2:
+            break
+
+    if progress is not None:
+        pct = min(1.0, len(cards)/max(1, target_n))
+        progress.progress(pct, text=f"Concluído: {len(cards)}/{target_n}")
+        time.sleep(0.3)
+        progress.empty()
+
     return cards[:target_n]
 
 # ------------------------------------------------------------------------------
