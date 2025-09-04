@@ -1,55 +1,41 @@
 """
-Anki Deck Generator (Topic or Documents) with OpenAI + TTS
+Streamlit Anki Deck Generator (Topic or Documents) with OpenAI + TTS
 
-Features
-- Suggests how many cards to create and which card types to prefer per deck using AI
-- Generates high‑quality, atomic Anki cards (Basic, Basic (and reversed), Cloze)
-- Optional text‑to‑speech (TTS) audio on the question/answer using OpenAI TTS
-- Ingests: a topic prompt OR one/more documents (.txt/.md/.pdf)
-- Exports a self‑contained .apkg you can import into Anki
+Usage
+- Run:  
+    pip install streamlit openai genanki pypdf python-dotenv  
+    streamlit run app.py
+- Provide a topic OR upload documents (.txt/.md/.pdf)
+- Click **Suggest plan** → **Generate deck** → **Download .apkg** for Anki
 
-Requirements (install first)
-    pip install openai genanki pypdf python-dotenv
-
-Environment
-    Set OPENAI_API_KEY in your environment or a .env file at project root.
-
-Usage examples
-    python anki_deck_generator.py --deck "HSK1 - Food" --topic "Chinese food vocabulary: 50 items with example sentences" --lang zh
-    python anki_deck_generator.py --deck "EU Law - Asylum CEAS" --docs notes1.pdf ceas_overview.txt --max-cards 80
-    python anki_deck_generator.py --deck "French Past Tenses" --topic "Passé composé vs imparfait: signals, conjugations, pitfalls" --voice alloy --tts-on question answer
-
-Notes on best practices baked in
-- Atomic facts; one fact per card; avoid lists-on-a-card
-- Active recall first; optional reverse only when symmetric (e.g., vocabulary)
-- Use Cloze for processes/definitions with natural blanks (no orphaned clozes)
-- Include a concrete example or minimal pair where helpful
-- Keep phrasing unambiguous; add disambiguating context in parentheses when needed
-- Avoid synonyms that make grading fuzzy; include the canonical expected answer
-- Tag cards consistently for filtering and interleaving (topic/subtopic/source)
-- Keep card counts within a daily review budget; we auto-suggest a plan
+Notes on Best Practices (built-in)
+- Atomic facts (one fact per card), clear phrasing, active recall
+- Reverse cards only for symmetric pairs (e.g., vocab)
+- Cloze for processes/definitions; natural spans (no dangling articles)
+- Include short, concrete examples; disambiguate where needed
+- AI suggests card counts and type mix (20–60 by default); adjustable
 """
 
 from __future__ import annotations
-import argparse
 import os
+import io
 import re
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
+
+import streamlit as st
 
 # Third‑party
 try:
     import genanki
 except ImportError:
-    print("Missing dependency: genanki. Install with `pip install genanki`.", file=sys.stderr)
-    raise
+    st.stop()
 
 try:
     from pypdf import PdfReader
 except Exception:
-    PdfReader = None  # optional
+    PdfReader = None
 
 try:
     from dotenv import load_dotenv
@@ -61,8 +47,8 @@ except Exception:
 try:
     from openai import OpenAI
 except ImportError:
-    print("Missing dependency: openai. Install with `pip install openai`.", file=sys.stderr)
-    raise
+    st.error("Missing dependency: openai. Install with `pip install openai`.")
+    st.stop()
 
 # -------------------------
 # Data structures
@@ -81,50 +67,13 @@ class Card:
 @dataclass
 class DeckPlan:
     suggested_total: int
-    mix: Dict[str, int]  # e.g., {"basic": 20, "basic_reverse": 15, "cloze": 15}
+    mix: Dict[str, int]
     rationale: str
     notes: str
 
 # -------------------------
-# Helpers: I/O and ingestion
+# OpenAI helpers
 # -------------------------
-
-def read_text_from_docs(paths: List[str]) -> str:
-    texts = []
-    for p in paths:
-        if not os.path.exists(p):
-            print(f"[warn] File not found: {p}", file=sys.stderr)
-            continue
-        ext = os.path.splitext(p)[1].lower()
-        try:
-            if ext in [".txt", ".md", ".csv"]:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    texts.append(f.read())
-            elif ext == ".pdf" and PdfReader is not None:
-                reader = PdfReader(p)
-                buf = []
-                for page in reader.pages:
-                    try:
-                        buf.append(page.extract_text() or "")
-                    except Exception:
-                        continue
-                texts.append("\n".join(buf))
-            else:
-                print(f"[warn] Unsupported extension or pypdf missing: {p}", file=sys.stderr)
-        except Exception as e:
-            print(f"[warn] Could not read {p}: {e}", file=sys.stderr)
-    return "\n\n".join(texts)
-
-# -------------------------
-# OpenAI wrappers
-# -------------------------
-
-def get_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("OPENAI_API_KEY is not set. Export it or create a .env file.", file=sys.stderr)
-        sys.exit(1)
-    return OpenAI()
 
 SYSTEM_PLANNER = (
     "You are an expert learning scientist and Anki power user. "
@@ -165,7 +114,45 @@ Return JSON list where each item has: card_type (basic|basic_reverse|cloze), fro
 """
 
 # -------------------------
-# Planning and generation
+# I/O helpers
+# -------------------------
+
+def read_text_from_docs(files) -> str:
+    texts: List[str] = []
+    for f in files or []:
+        name = getattr(f, 'name', 'upload')
+        ext = os.path.splitext(name)[1].lower()
+        try:
+            if ext in [".txt", ".md", ".csv"]:
+                texts.append(f.read().decode("utf-8", errors="ignore"))
+            elif ext == ".pdf" and PdfReader is not None:
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    tmp.write(f.read())
+                    tmp.flush()
+                    reader = PdfReader(tmp.name)
+                buf = []
+                for page in reader.pages:
+                    try:
+                        buf.append(page.extract_text() or "")
+                    except Exception:
+                        continue
+                texts.append("\n".join(buf))
+            else:
+                texts.append("")
+        except Exception as e:
+            st.warning(f"Could not read {name}: {e}")
+    return "\n\n".join([t for t in texts if t])
+
+
+def get_client(api_key: Optional[str]) -> OpenAI:
+    key = api_key or os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OpenAI API key not provided. Set in the sidebar or OPENAI_API_KEY env var.")
+    os.environ["OPENAI_API_KEY"] = key
+    return OpenAI()
+
+# -------------------------
+# Generation core
 # -------------------------
 
 def suggest_deck_plan(client: OpenAI, topic: str, source_text: str, max_cards: int, profile: str = "") -> DeckPlan:
@@ -226,8 +213,12 @@ def generate_cards(client: OpenAI, topic: str, source_text: str, n: int, mix: Di
     return cards
 
 # -------------------------
-# TTS synthesis
+# TTS
 # -------------------------
+
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
 
 def synthesize_tts_batch(client: OpenAI, texts: List[str], voice: str = "alloy", outdir: str = "media") -> List[str]:
     os.makedirs(outdir, exist_ok=True)
@@ -249,7 +240,7 @@ def synthesize_tts_batch(client: OpenAI, texts: List[str], voice: str = "alloy",
     return paths
 
 # -------------------------
-# Anki models and packaging
+# Anki models & packaging
 # -------------------------
 
 def build_models() -> Dict[str, genanki.Model]:
@@ -324,16 +315,15 @@ def build_models() -> Dict[str, genanki.Model]:
     return {"basic": basic_model, "basic_reverse": basic_rev_model, "cloze": cloze_model}
 
 
-def package_deck(deck_name: str, cards: List[Card], voice: Optional[str], tts_on: List[str], out_path: str) -> str:
+def package_deck_bytes(deck_name: str, cards: List[Card], voice: Optional[str], tts_on: List[str]) -> bytes:
     models = build_models()
     deck = genanki.Deck(genanki.guid_for(deck_name), deck_name)
     media_files = []
 
-    # If TTS enabled, synthesize first to map onto cards deterministically
+    # Optional TTS
     if voice and tts_on:
-        client = get_client()
-        texts = []
-        # Collect in the same order we will assign
+        client = OpenAI()
+        texts: List[str] = []
         for c in cards:
             if c.card_type == "cloze":
                 if "question" in tts_on:
@@ -346,7 +336,6 @@ def package_deck(deck_name: str, cards: List[Card], voice: Optional[str], tts_on
                 if "answer" in tts_on:
                     texts.append(strip_html(c.back))
         tts_paths = synthesize_tts_batch(client, texts, voice=voice)
-        # Re-assign into cards
         idx = 0
         for c in cards:
             if "question" in tts_on:
@@ -360,7 +349,6 @@ def package_deck(deck_name: str, cards: List[Card], voice: Optional[str], tts_on
                     media_files.append(c.audio_back)
                 idx += 1
 
-    # Add notes
     for c in cards:
         if c.card_type == "cloze":
             model = models["cloze"]
@@ -379,82 +367,133 @@ def package_deck(deck_name: str, cards: List[Card], voice: Optional[str], tts_on
     pkg = genanki.Package(deck)
     if media_files:
         pkg.media_files = media_files
-    pkg.write_to_file(out_path)
-    return out_path
+    # Write to BytesIO
+    with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
+        pkg.write_to_file(tmp.name)
+        tmp.flush()
+        data = open(tmp.name, "rb").read()
+    return data
 
 # -------------------------
-# Utilities
+# Streamlit UI
 # -------------------------
 
-def strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text or "").strip()
+st.set_page_config(page_title="Anki Deck Generator", page_icon="🧠", layout="centered")
 
-# -------------------------
-# Main routine
-# -------------------------
+st.title("🧠 Anki Deck Generator")
+st.caption("Topic or documents → AI‑planned deck → atomic cards → optional TTS → .apkg download")
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate Anki deck from topic or documents using OpenAI + TTS")
-    parser.add_argument("--deck", required=True, help="Deck name")
-    parser.add_argument("--topic", default="", help="Topic/goal prompt for the deck")
-    parser.add_argument("--docs", nargs="*", default=[], help="Path(s) to .txt/.md/.pdf to ingest")
-    parser.add_argument("--profile", default="", help="Learner profile (e.g., 'beginner Chinese, daily 20 cards')")
-    parser.add_argument("--lang", default="", help="Target language (e.g., 'zh', 'fr'). Leave empty for general topics")
-    parser.add_argument("--max-cards", type=int, default=60, help="Upper bound for suggested cards")
-    parser.add_argument("--min-cards", type=int, default=20, help="Lower bound for fallback if suggestion fails")
-    parser.add_argument("--constraints", default="Prefer atomic facts; avoid ambiguity; include examples where helpful.")
-    parser.add_argument("--voice", default="", help="OpenAI TTS voice (e.g., 'alloy'). Empty disables TTS")
-    parser.add_argument("--tts-on", nargs="*", default=[], choices=["question", "answer"], help="Where to attach TTS audio")
-    parser.add_argument("--tags", nargs="*", default=[], help="Additional tags to attach to all cards")
-    parser.add_argument("--out", default="deck.apkg", help="Output .apkg path")
+with st.sidebar:
+    st.header("🔑 API & Settings")
+    api_key = st.text_input("OpenAI API Key", type="password", help="Not stored; used only for this session. Or set OPENAI_API_KEY env var.")
+    default_model = "gpt-4o-mini"
+    st.markdown("**Model**: gpt-4o-mini (fixed in this demo)")
 
-    args = parser.parse_args()
+    st.divider()
+    st.header("🗣️ TTS (optional)")
+    use_tts = st.checkbox("Enable TTS", value=False)
+    voice = st.selectbox("Voice", ["alloy", "verse", "florence", "aria"], index=0, disabled=not use_tts)
+    tts_on_q = st.checkbox("Attach audio to question", value=True, disabled=not use_tts)
+    tts_on_a = st.checkbox("Attach audio to answer", value=False, disabled=not use_tts)
 
-    if not args.topic and not args.docs:
-        print("Provide --topic or --docs (or both).", file=sys.stderr)
-        sys.exit(2)
+st.subheader("1) Input")
+colA, colB = st.columns(2)
+with colA:
+    deck_name = st.text_input("Deck name", value="My AI Deck")
+    topic = st.text_area("Topic / goal (or leave blank if using documents)", placeholder="e.g., HSK1 Chinese food vocabulary" )
+    profile = st.text_input("Learner profile (optional)", placeholder="e.g., beginner Chinese, 20 new/day")
+    lang = st.text_input("Target language (optional)", placeholder="e.g., zh, fr, es")
+with colB:
+    docs = st.file_uploader("Upload documents (.txt/.md/.pdf)", type=["txt","md","pdf"], accept_multiple_files=True)
+    max_cards = st.slider("Max cards (AI suggestion cap)", 20, 120, 60, step=5)
+    constraints = st.text_area("Constraints / tips to the card writer", value="Prefer atomic facts; avoid ambiguity; include examples where helpful.")
 
-    client = get_client()
+source_text = read_text_from_docs(docs) if docs else ""
 
-    source_text = read_text_from_docs(args.docs) if args.docs else ""
-    topic = args.topic or (os.path.basename(args.docs[0]) if args.docs else "Untitled Deck")
+if not topic and not source_text:
+    st.info("Provide a topic or upload at least one document.")
 
-    # 1) Suggest a plan
-    plan = suggest_deck_plan(client, topic=topic, source_text=source_text, max_cards=args.max_cards, profile=args.profile)
-    print("Suggested plan:")
-    print(f"  Total: {plan.suggested_total}")
-    print(f"  Mix: {plan.mix}")
-    print(f"  Rationale: {plan.rationale}")
-    if plan.notes:
-        print(f"  Notes: {plan.notes}")
+st.subheader("2) Suggest plan")
+if st.button("Suggest plan", disabled=not (topic or source_text)):
+    try:
+        client = get_client(api_key)
+        with st.status("Asking AI for a deck plan…", state="running") as s:
+            plan = suggest_deck_plan(client, topic=topic or (docs[0].name if docs else "Untitled"), source_text=source_text, max_cards=max_cards, profile=profile)
+            s.update(label="Plan ready", state="complete")
+        st.session_state["plan"] = plan
+    except Exception as e:
+        st.error(f"Planning failed: {e}")
 
-    # Ensure within bounds
-    n = max(args.min_cards, min(args.max_cards, plan.suggested_total))
+plan: Optional[DeckPlan] = st.session_state.get("plan")
+if plan:
+    st.success(f"Suggested total: {plan.suggested_total} | Mix: {plan.mix}")
+    with st.expander("Rationale & notes"):
+        st.write(plan.rationale or "—")
+        if plan.notes:
+            st.info(plan.notes)
+    # Allow user override
+    st.subheader("Adjust plan (optional)")
+    total_override = st.number_input("Total cards", min_value=10, max_value=200, value=int(plan.suggested_total))
+    basic = st.number_input("Basic", min_value=0, max_value=200, value=int(plan.mix.get("basic", 0)))
+    basic_rev = st.number_input("Basic (and reversed)", min_value=0, max_value=200, value=int(plan.mix.get("basic_reverse", 0)))
+    cloze = st.number_input("Cloze", min_value=0, max_value=200, value=int(plan.mix.get("cloze", 0)))
 
-    # 2) Generate cards
-    # Smart default tags
-    auto_tags = [re.sub(r"\W+", "_", args.deck.lower()).strip("_")]
-    tags = sorted(set(auto_tags + args.tags))
+    if basic + basic_rev + cloze != total_override:
+        st.warning("Sum of types doesn't match total. The generator will use the total value for the number of cards.")
 
-    cards = generate_cards(
-        client,
-        topic=topic,
-        source_text=source_text,
-        n=n,
-        mix=plan.mix,
-        lang=args.lang,
-        constraints=args.constraints,
-        tags=tags,
+    st.subheader("3) Generate deck")
+    if st.button("Generate deck", use_container_width=True):
+        try:
+            client = get_client(api_key)
+            tags = [re.sub(r"\W+", "_", deck_name.lower()).strip("_")]
+
+            with st.status("Creating cards…", state="running") as s:
+                cards = generate_cards(
+                    client,
+                    topic=(topic or deck_name),
+                    source_text=source_text,
+                    n=int(total_override),
+                    mix={"basic": int(basic), "basic_reverse": int(basic_rev), "cloze": int(cloze)},
+                    lang=lang,
+                    constraints=constraints,
+                    tags=tags,
+                )
+                s.update(label="Packaging deck…")
+                tts_on = (["question"] if st.session_state.get("tts_on_q", tts_on_q) else []) + (["answer"] if st.session_state.get("tts_on_a", tts_on_a) else [])
+                voice_sel = voice if use_tts else None
+                apkg_bytes = package_deck_bytes(deck_name, cards, voice=voice_sel, tts_on=tts_on)
+                s.update(label="Done", state="complete")
+
+            st.session_state["apkg"] = apkg_bytes
+            st.session_state["cards_preview"] = cards[: min(10, len(cards))]
+            st.success("Deck generated!")
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+
+# Preview & download
+apkg = st.session_state.get("apkg")
+preview = st.session_state.get("cards_preview")
+if preview:
+    st.subheader("Preview (first 10 cards)")
+    for i, c in enumerate(preview, 1):
+        with st.expander(f"{i}. {c.card_type.upper()} — {c.front[:60]}…"):
+            st.markdown(f"**Front:** {c.front}")
+            st.markdown(f"**Back:** {c.back}")
+            if c.example:
+                st.markdown(f"**Example:** {c.example}")
+            if c.tags:
+                st.caption("Tags: " + ", ".join(sorted(set(c.tags))))
+
+if apkg:
+    st.subheader("4) Download")
+    st.download_button("Download .apkg", data=apkg, file_name=f"{re.sub(r'[^A-Za-z0-9_-]+','_', (deck_name or 'deck'))}.apkg", mime="application/octet-stream")
+
+st.markdown("---")
+with st.expander("ℹ️ Tips for best learning outcomes"):
+    st.markdown(
+        "- Keep decks focused (20–60 new facts); avoid encyclopedic mixes.\n"
+        "- Prefer **atomic** cards; split complex ideas.\n"
+        "- Use **Cloze** for processes/definitions; **Basic+Reverse** only for symmetric pairs.\n"
+        "- Add short examples; avoid fuzzy synonyms; include disambiguation in parentheses.\n"
+        "- Interleave study; tag consistently; adjust your daily new card limit to protect review health."
     )
-
-    # 3) Package deck (+ optional TTS)
-    voice = args.voice.strip() or None
-    tts_on = args.tts_on
-    out_path = os.path.abspath(args.out)
-    package_deck(args.deck, cards, voice=voice, tts_on=tts_on, out_path=out_path)
-
-    print(f"\nDone. Deck written to: {out_path}")
-
-
-if __name__ == "__main__":
-    main()
