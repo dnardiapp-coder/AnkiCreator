@@ -110,7 +110,8 @@ Constraints: {constraints}
 
 Source material (optional):\n{source_text}
 
-Return JSON list where each item has: card_type (basic|basic_reverse|cloze), front, back, example (optional), tags (list of strings). Keep strings single-line (use \n if needed). Make sure exactly {{cN::...}} syntax for cloze.
+Return a **JSON object** with a top-level key `cards`, where `cards` is a list of objects. Each object has: card_type (basic|basic_reverse|cloze), front, back, example (optional), tags (list of strings). Keep strings single-line (use 
+ if needed). Make sure exactly {{cN::...}} syntax for cloze.
 """
 
 # -------------------------
@@ -163,7 +164,7 @@ def suggest_deck_plan(client: OpenAI, topic: str, source_text: str, max_cards: i
         max_cards=max_cards,
     )
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         temperature=0.3,
         messages=[
             {"role": "system", "content": SYSTEM_PLANNER},
@@ -172,11 +173,23 @@ def suggest_deck_plan(client: OpenAI, topic: str, source_text: str, max_cards: i
         response_format={"type": "json_object"},
     )
     import json
-    data = json.loads(resp.choices[0].message.content)
-    suggested_total = int(data.get("suggested_total", 40))
-    mix = data.get("mix", {"basic": suggested_total, "basic_reverse": 0, "cloze": 0})
-    rationale = data.get("rationale", "")
-    notes = data.get("notes", "")
+    raw = resp.choices[0].message.content
+    data = json.loads(raw)
+    # Normalize mix to a dict of ints
+    def to_int(x, default=0):
+        try:
+            return int(x)
+        except Exception:
+            return default
+    mix_raw = data.get("mix", {}) if isinstance(data, dict) else {}
+    mix = {
+        "basic": to_int(mix_raw.get("basic", 0)),
+        "basic_reverse": to_int(mix_raw.get("basic_reverse", 0)),
+        "cloze": to_int(mix_raw.get("cloze", 0)),
+    }
+    suggested_total = to_int(data.get("suggested_total", sum(mix.values()) or 40), 40)
+    rationale = data.get("rationale", "") if isinstance(data, dict) else ""
+    notes = data.get("notes", "") if isinstance(data, dict) else ""
     return DeckPlan(suggested_total=suggested_total, mix=mix, rationale=rationale, notes=notes)
 
 
@@ -199,14 +212,35 @@ def generate_cards(client: OpenAI, topic: str, source_text: str, n: int, mix: Di
         response_format={"type": "json_object"},
     )
     import json
-    items = json.loads(resp.choices[0].message.content)
+    raw = resp.choices[0].message.content
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # Sometimes models wrap JSON in a string; try a second parse
+        data = json.loads(json.loads(raw))
+    # Accept either an object with key 'cards' or a bare list
+    items = None
+    if isinstance(data, dict):
+        for key in ("cards", "items", "data", "list"):
+            if key in data and isinstance(data[key], list):
+                items = data[key]
+                break
+    if items is None and isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        raise ValueError("Model did not return a list of cards under 'cards'.")
+
     cards: List[Card] = []
     for it in items:
+        if isinstance(it, str):
+            # Skip stray strings; or treat as a simple 'front' with empty back
+            # Here we skip to avoid malformed notes
+            continue
         c = Card(
-            card_type=it.get("card_type", "basic"),
-            front=it.get("front", "").strip(),
-            back=it.get("back", "").strip(),
-            example=(it.get("example") or "").strip() or None,
+            card_type=(it.get("card_type") or "basic").strip(),
+            front=(it.get("front") or "").strip(),
+            back=(it.get("back") or "").strip(),
+            example=((it.get("example") or "").strip() or None),
             tags=list(set((it.get("tags") or []) + tags)),
         )
         cards.append(c)
@@ -405,7 +439,7 @@ with colA:
     lang = st.text_input("Target language (optional)", placeholder="e.g., zh, fr, es")
 with colB:
     docs = st.file_uploader("Upload documents (.txt/.md/.pdf)", type=["txt","md","pdf"], accept_multiple_files=True)
-    max_cards = st.slider("Max cards (AI suggestion cap)", 20, 120, 60, step=5)
+    max_cards = st.slider("Max cards (AI suggestion cap)", 20, 500, 100, step=10)
     constraints = st.text_area("Constraints / tips to the card writer", value="Prefer atomic facts; avoid ambiguity; include examples where helpful.")
 
 source_text = read_text_from_docs(docs) if docs else ""
@@ -431,12 +465,15 @@ if plan:
         st.write(plan.rationale or "—")
         if plan.notes:
             st.info(plan.notes)
+    # Optional warning for big TTS runs
+    if use_tts and int(getattr(plan, "suggested_total", 0)) > 250:
+        st.warning("TTS for very large decks (>250 cards) can take a long time and create large .apkg files. Consider turning off TTS or generating in chunks.")
     # Allow user override
     st.subheader("Adjust plan (optional)")
-    total_override = st.number_input("Total cards", min_value=10, max_value=200, value=int(plan.suggested_total))
-    basic = st.number_input("Basic", min_value=0, max_value=200, value=int(plan.mix.get("basic", 0)))
-    basic_rev = st.number_input("Basic (and reversed)", min_value=0, max_value=200, value=int(plan.mix.get("basic_reverse", 0)))
-    cloze = st.number_input("Cloze", min_value=0, max_value=200, value=int(plan.mix.get("cloze", 0)))
+    total_override = st.number_input("Total cards", min_value=10, max_value=500, value=int(plan.suggested_total))
+    basic = st.number_input("Basic", min_value=0, max_value=500, value=int(plan.mix.get("basic", 0)))
+    basic_rev = st.number_input("Basic (and reversed)", min_value=0, max_value=500, value=int(plan.mix.get("basic_reverse", 0)))
+    cloze = st.number_input("Cloze", min_value=0, max_value=500, value=int(plan.mix.get("cloze", 0)))
 
     if basic + basic_rev + cloze != total_override:
         st.warning("Sum of types doesn't match total. The generator will use the total value for the number of cards.")
