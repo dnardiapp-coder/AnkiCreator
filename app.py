@@ -164,7 +164,7 @@ def suggest_deck_plan(client: OpenAI, topic: str, source_text: str, max_cards: i
         max_cards=max_cards,
     )
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         temperature=0.3,
         messages=[
             {"role": "system", "content": SYSTEM_PLANNER},
@@ -236,12 +236,26 @@ def generate_cards(client: OpenAI, topic: str, source_text: str, n: int, mix: Di
             # Skip stray strings; or treat as a simple 'front' with empty back
             # Here we skip to avoid malformed notes
             continue
+        model_tags = it.get("tags") if isinstance(it, dict) else []
+        if isinstance(model_tags, str):
+            model_tags = [model_tags]
+        elif not isinstance(model_tags, list):
+            model_tags = []
+        combined = list(model_tags) + list(tags)
+        safe = []
+        for t in combined:
+            stg = sanitize_tag(t)
+            if stg:
+                safe.append(stg)
+        # deduplicate while preserving order
+        seen = set()
+        safe = [x for x in safe if not (x in seen or seen.add(x))]
         c = Card(
             card_type=(it.get("card_type") or "basic").strip(),
             front=(it.get("front") or "").strip(),
             back=(it.get("back") or "").strip(),
             example=((it.get("example") or "").strip() or None),
-            tags=list(set((it.get("tags") or []) + tags)),
+            tags=safe,
         )
         cards.append(c)
     return cards
@@ -271,6 +285,19 @@ def synthesize_tts_batch(client: OpenAI, texts: List[str], voice: str = "alloy",
             resp.stream_to_file(filename)
         paths.append(filename)
     return paths
+
+def sanitize_tag(t: object) -> str:
+    """Sanitize a tag for Anki: no spaces; only word chars (: . _ - allowed), lowercase, collapse repeats."""
+    s = str(t or "").strip().lower()
+    # spaces -> underscore
+    s = "_".join(s.split())
+    # allow only a-z, 0-9, colon, dot, underscore, dash
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789:._-")
+    s = "".join(ch if ch in allowed else "_" for ch in s)
+    # collapse repeats and trim
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
 
 # -------------------------
 # Anki models & packaging
@@ -481,7 +508,7 @@ if plan:
     if st.button("Generate deck", use_container_width=True):
         try:
             client = get_client(api_key)
-            tags = [re.sub(r"\W+", "_", deck_name.lower()).strip("_")]
+            tags = [sanitize_tag(deck_name)]
 
             with st.status("Creating cards…", state="running") as s:
                 cards = generate_cards(
