@@ -163,7 +163,7 @@ def suggest_deck_plan(client: OpenAI, topic: str, source_text: str, max_cards: i
         max_cards=max_cards,
     )
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         temperature=0.3,
         messages=[
             {"role": "system", "content": SYSTEM_PLANNER},
